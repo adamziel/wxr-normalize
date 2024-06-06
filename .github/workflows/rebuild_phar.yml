@@ -3,11 +3,6 @@ name: PHP Preprocess and Commit
 on:
   push:
     branches:
-      - main
-      - trunk
-  pull_request:
-    branches:
-      - main
       - trunk
 
 jobs:
@@ -18,7 +13,7 @@ jobs:
     - name: Setup SSH Keys
       uses: webfactory/ssh-agent@v0.5.3
       with:
-        ssh-private-key: ${{ secrets.GH_DEPLOY_KEY }}
+        ssh-private-key: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Checkout repository
       uses: actions/checkout@v3
