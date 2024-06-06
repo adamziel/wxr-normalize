@@ -1,0 +1,44 @@
+name: PHP Preprocess and Commit
+
+on:
+  push:
+    branches:
+      - main
+      - trunk
+  pull_request:
+    branches:
+      - main
+      - trunk
+
+jobs:
+  php-preprocess:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Setup SSH Keys
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.GH_DEPLOY_KEY }}
+
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1' # Change to the desired PHP version
+        coverage: none
+
+    - name: Run PHP preprocess
+      run: php -dphar.readonly=0 preprocess-wxr.php --bundle
+
+    - name: Push rebuilt WordPress to GitHub
+      run: |
+        git config --global user.name "deployment_bot"
+        git config --global user.email "deployment_bot@users.noreply.github.com"
+        git add -A
+        git commit -a -m "Reindex and reformat Blueprints"
+        git pull --rebase
+        if [ $? -eq 0 ]; then
+            git push git@github.com:${{ github.repository }}.git --follow-tags
+        fi;
