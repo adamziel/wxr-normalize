@@ -37,9 +37,9 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			case '#block-comment':
 				return $this->next_url_block_attribute();
 				break;
-			// case '#text':
-			//     $this->rewrite_text();
-			//     break;
+			case '#text':
+				return $this->next_url_in_text_node();
+				break;
 		}
 	}
 
@@ -50,6 +50,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 
 		return parent::next_token();
 	}
+
 
 	/**
 	 * A list of HTML attributes meant to contain URLs, as defined in the HTML specification.
@@ -173,6 +174,11 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 
 		do {
 			$url_maybe = $this->block_attributes_iterator->current();
+			// @TODO: Investigate why LEAVES_ONLY isn't enough
+			if ( is_array( $url_maybe ) ) {
+				$this->block_attributes_iterator->next();
+				continue;
+			}
 			if ( URL::canParse( $url_maybe, $this->base_url ) ) {
 				$this->current_block_attribute_key   = $this->block_attributes_iterator->key();
 				$this->current_block_attribute_value = $url_maybe;

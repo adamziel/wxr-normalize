@@ -62,6 +62,18 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 	            'https://mysite.com/wp-content/image.png',
 	            '<!-- wp:image {"class": "wp-bold", "src": "https://mysite.com/wp-content/image.png"} -->'
             ],
+            'In a block attribute, in a nested object, when it contains just the URL' => [
+	            'https://mysite.com/wp-content/image.png',
+	            '<!-- wp:image {"class": "wp-bold", "meta": { "src": "https://mysite.com/wp-content/image.png" } } -->'
+            ],
+            'In a block attribute, in an array, when it contains just the URL' => [
+	            'https://mysite.com/wp-content/image.png',
+	            '<!-- wp:image {"class": "wp-bold", "srcs": [ "https://mysite.com/wp-content/image.png" ] } -->'
+            ],
+            'In a text node, when it contains a well-formed absolute URL' => [
+	            'https://wordpress.org',
+	            'Have you seen https://wordpress.org? '
+            ],
         ];
     }
 
