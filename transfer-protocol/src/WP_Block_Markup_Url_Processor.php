@@ -9,11 +9,36 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 
 	private $url;
 	private $base_url;
-	private $inspected_attribute_idx = - 1;
+	private $url_in_text_processor;
+	private $url_in_text_node_updated;
+	private $inspected_url_attribute_idx = - 1;
 
 	public function __construct( $html, $base_url = null ) {
 		parent::__construct( $html );
 		$this->base_url = $base_url;
+	}
+
+	public function get_updated_html() {
+		if ( $this->url_in_text_node_updated ) {
+			$this->set_modifiable_text( $this->url_in_text_processor->get_updated_text() );
+			$this->url_in_text_node_updated = false;
+			$this->url_in_text_processor    = null;
+		}
+
+		return parent::get_updated_html();
+	}
+
+	public function get_url() {
+		return $this->url;
+	}
+
+	public function next_token() {
+		$this->url                      = null;
+		$this->inspected_url_attribute_idx = - 1;
+		// Do not reset url_in_text_node_updated – it's reset in get_updated_html() which
+		// is called in parent::next_token().
+
+		return parent::next_token();
 	}
 
 	public function next_url() {
@@ -26,29 +51,105 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 		return false;
 	}
 
-	public function get_url() {
-		return $this->url;
-	}
-
-	private function next_url_in_current_token() {
+	public function next_url_in_current_token() {
 		switch ( parent::get_token_type() ) {
 			case '#tag':
 				return $this->next_url_attribute();
 			case '#block-comment':
 				return $this->next_url_block_attribute();
-				break;
 			case '#text':
 				return $this->next_url_in_text_node();
-				break;
 		}
 	}
 
-	public function next_token() {
-		$this->url                       = null;
-		$this->inspected_attribute_idx   = - 1;
-		$this->block_attributes_iterator = null;
+	public function next_url_in_text_node() {
+		if ( $this->get_token_type() !== '#text' ) {
+			return false;
+		}
 
-		return parent::next_token();
+		if ( null === $this->url_in_text_processor ) {
+			$this->url_in_text_processor = new WP_Migration_URL_In_Text_Processor( $this->get_modifiable_text() );
+		}
+
+		if ( ! $this->url_in_text_processor->next_url() ) {
+			return false;
+		}
+
+		$this->url = $this->url_in_text_processor->get_url();
+
+		return true;
+	}
+
+	private function next_url_attribute() {
+		$tag = $this->get_tag();
+		if (
+			! array_key_exists( $tag, self::URL_ATTRIBUTES ) &&
+			$tag !== 'INPUT' // type=image => src,
+		) {
+			return false;
+		}
+
+		while ( true ) {
+			++ $this->inspected_url_attribute_idx;
+			if ( $this->inspected_url_attribute_idx >= count( self::URL_ATTRIBUTES[ $tag ] ) ) {
+				return false;
+			}
+			$this->url = $this->get_attribute(
+				self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ]
+			);
+			if ( $this->url !== null ) {
+				break;
+			}
+		}
+
+		if ( null === $this->url ) {
+			return false;
+		}
+
+		return true;
+	}
+
+	private function next_url_block_attribute() {
+		while($this->next_block_attribute()){
+			$url_maybe = $this->get_block_attribute_value();
+			if ( URL::canParse( $url_maybe, $this->base_url ) ) {
+				$this->url                           = $url_maybe;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public function set_url( $new_url ) {
+		if ( null === $this->url ) {
+			return false;
+		}
+		switch ( parent::get_token_type() ) {
+			case '#tag':
+				$tag = $this->get_tag();
+				if ( ! array_key_exists( $tag, self::URL_ATTRIBUTES ) ) {
+					return false;
+				}
+				if ( ! array_key_exists( $this->inspected_url_attribute_idx, self::URL_ATTRIBUTES[ $tag ] ) ) {
+					return false;
+				}
+				$this->set_attribute(
+					self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ],
+					$new_url
+				);
+
+				return true;
+
+			case '#block-comment':
+				return $this->set_block_attribute_value( $new_url );
+
+			case '#text':
+				if ( null === $this->url_in_text_processor ) {
+					return false;
+				}
+				$this->url_in_text_node_updated = true;
+				return $this->url_in_text_processor->set_url( $new_url );
+		}
 	}
 
 
@@ -119,96 +220,5 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 		'STYLE',
 		'SCRIPT',
 	];
-
-	private function next_url_attribute() {
-		$tag = $this->get_tag();
-		if (
-			! array_key_exists( $tag, self::URL_ATTRIBUTES ) &&
-			$tag !== 'INPUT' // type=image => src,
-		) {
-			return false;
-		}
-
-		while ( true ) {
-			++ $this->inspected_attribute_idx;
-			if ( $this->inspected_attribute_idx >= count( self::URL_ATTRIBUTES[ $tag ] ) ) {
-				return false;
-			}
-			$this->url = $this->get_attribute(
-				self::URL_ATTRIBUTES[ $tag ][ $this->inspected_attribute_idx ]
-			);
-			if ( $this->url !== null ) {
-				break;
-			}
-		}
-
-		if ( null === $this->url ) {
-			return false;
-		}
-
-		return true;
-	}
-
-	/**
-	 * @var \RecursiveIteratorIterator
-	 */
-	private $block_attributes_iterator;
-	private $current_block_attribute_key = null;
-	private $current_block_attribute_value = null;
-
-	private function next_url_block_attribute() {
-		if ( null === $this->block_attributes || 0 === count( $this->block_attributes ) ) {
-			return false;
-		}
-
-		if ( null === $this->block_attributes_iterator ) {
-			// Re-entrant iteration over the block attributes.
-			$this->block_attributes_iterator = new \RecursiveIteratorIterator(
-				new \RecursiveArrayIterator( $this->block_attributes ),
-				\RecursiveIteratorIterator::SELF_FIRST,
-				\RecursiveIteratorIterator::LEAVES_ONLY
-			);
-		} else {
-			$this->block_attributes_iterator->next();
-		}
-
-		do {
-			$url_maybe = $this->block_attributes_iterator->current();
-			// @TODO: Investigate why LEAVES_ONLY isn't enough
-			if ( is_array( $url_maybe ) ) {
-				$this->block_attributes_iterator->next();
-				continue;
-			}
-			if ( URL::canParse( $url_maybe, $this->base_url ) ) {
-				$this->current_block_attribute_key   = $this->block_attributes_iterator->key();
-				$this->current_block_attribute_value = $url_maybe;
-				$this->url                           = $url_maybe;
-
-				return true;
-			}
-			$this->block_attributes_iterator->next();
-		} while ( $this->block_attributes_iterator->valid() );
-
-		return false;
-	}
-
-	public function get_current_block_attribute_key() {
-		if ( null === $this->block_attributes_iterator || null === $this->current_block_attribute_key ) {
-			return false;
-		}
-
-		return $this->current_block_attribute_key;
-	}
-
-	public function get_current_block_attribute_value() {
-		if ( null === $this->block_attributes_iterator || null === $this->current_block_attribute_key ) {
-			return false;
-		}
-		if ( null === $this->current_block_attribute_value ) {
-			$this->current_block_attribute_value = $this->block_attributes_iterator->current();
-		}
-
-		return $this->current_block_attribute_value;
-	}
 
 }

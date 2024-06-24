@@ -74,6 +74,18 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 	            'https://wordpress.org',
 	            'Have you seen https://wordpress.org? '
             ],
+            'In a text node, when it contains a protocol-relative absolute URL' => [
+	            '//wordpress.org',
+	            'Have you seen //wordpress.org? '
+            ],
+            'In a text node, when it contains a domain-only absolute URL' => [
+	            'wordpress.org',
+	            'Have you seen wordpress.org? '
+            ],
+            'In a text node, when it contains a domain-only absolute URL with path' => [
+	            'wordpress.org/plugins',
+	            'Have you seen wordpress.org/plugins? '
+            ],
         ];
     }
 
@@ -106,6 +118,86 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
 		$this->assertEquals( 'https://third-url.org', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+	}
+
+	/**
+	 *
+	 * @dataProvider provider_test_set_url_examples
+	 */
+	public function test_set_url($markup, $new_url, $new_markup)
+	{
+		$p = new WP_Block_Markup_Url_Processor($markup);
+		$this->assertTrue($p->next_url(), 'Failed to find the URL in the markup.');
+		$this->assertTrue($p->set_url($new_url), 'Failed to set the URL in the markup.');
+		$this->assertEquals($new_markup, $p->get_updated_html(), 'Failed to set the URL in the markup.');
+	}
+
+	static public function provider_test_set_url_examples()
+	{
+		return [
+			'In the href attribute of an <a> tag' => [
+				'<a href="https://wordpress.org">',
+				'https://w.org',
+				'<a href="https://w.org">'
+			],
+			'In the "src" block attribute' => [
+				'<!-- wp:image {"src": "https://mysite.com/wp-content/image.png"} -->',
+				'https://w.org',
+				'<!-- wp:image {"src": "https://w.org"} -->'
+			],
+			'In a text node' => [
+				'Have you seen https://wordpress.org yet?',
+				'https://w.org',
+				'Have you seen https://w.org yet?'
+			],
+		];
+	}
+
+	public function test_set_url_complex_test_case()
+	{
+		$p = new WP_Block_Markup_Url_Processor(<<<HTML
+<!-- wp:image {"src": "https://mysite.com/wp-content/image.png", "meta": {"src": "https://mysite.com/wp-content/image.png"}} -->
+	<img src="https://mysite.com/wp-content/image.png">
+<!-- /wp:image -->
+
+<!-- wp:paragraph -->
+<p>During the <a href="writeofpassage.school">Write of Passage</a>, I stubbornly tried to beat my writer’s block by writing until 3am multiple times. The burnout returned. I dropped everything and went to Greece for a week.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>
+Have you seen my blog, adamadam.blog? I told a story there of how I got my Bachelor's degree,
+check it out: https://adamadam.blog/2021/09/16/how-i-got-bachelors-in-six-months/
+</p>
+<!-- /wp:paragraph -->
+HTML
+		);
+
+		// Replace every url with 'https://site-export.internal'
+		while($p->next_url()) {
+			$p->set_url('https://site-export.internal');
+		}
+
+		$this->assertEquals(
+			<<<HTML
+<!-- wp:image {"src": "https://site-export.internal", "meta": {"src": "https://site-export.internal"}} -->
+	<img src="https://site-export.internal">
+<!-- /wp:image -->
+
+<!-- wp:paragraph -->
+<p>During the <a href="https://site-export.internal">Write of Passage</a>, I stubbornly tried to beat my writer’s block by writing until 3am multiple times. The burnout returned. I dropped everything and went to Greece for a week.</p>
+<!-- /wp:paragraph -->
+
+<!-- wp:paragraph -->
+<p>
+Have you seen my blog, https://site-export.internal? I told a story there of how I got my Bachelor's degree,
+check it out: https://site-export.internal
+</p>
+<!-- /wp:paragraph -->
+HTML,
+			$p->get_updated_html(),
+			'Failed to update all the URLs in the markup.'
+		);
 	}
 
 }

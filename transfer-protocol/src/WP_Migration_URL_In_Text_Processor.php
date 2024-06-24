@@ -11,6 +11,10 @@ use Rowbot\URL\URL;
  * * Domain-only, e.g. www.example.com
  * * Domain + path, e.g. www.example.com/path
  *
+ * ### Protocols
+ *
+ * As a migration-oriented tool, this processor will only consider http and https protocols.
+ *
  * ### Domain names
  *
  * UTF-8 characters in the domain names are supported even if they're
@@ -48,13 +52,16 @@ use Rowbot\URL\URL;
  * Would yield `https://w.org/plug(in)s`.
  *
  */
-class WP_URL_In_Text_Processor {
+class WP_Migration_URL_In_Text_Processor {
 
 	private $text;
-	private $bytes_already_parsed;
+	private $url_starts_at;
+	private $url_length;
+	private $bytes_already_parsed = 0;
 	private $url;
 	private $base_url = 'https://w.org';
 	private $regex;
+	private $lexical_updates = array();
 
 	private $strict = false;
 
@@ -79,7 +86,6 @@ class WP_URL_In_Text_Processor {
 		if ( ! self::$public_suffix_list ) {
 			self::$public_suffix_list = require_once __DIR__ . '/public_suffix_list.php';
 		}
-		$this->bytes_already_parsed = 0;
 		$this->text                 = $text;
 		// A reverse string is useful for lookups. It does not form a valid
 		// text since strrev doesn't support UTF-8, but that's okay. We're
@@ -91,10 +97,10 @@ class WP_URL_In_Text_Processor {
 
 		// Source: https://github.com/vstelmakh/url-highlight/blob/master/src/Matcher/Matcher.php
 		$this->regex = '/' . $prefix . '
-            (?|                                                        # scheme
-                (?<scheme>[a-z][\w\-]+):\/{2}                              # scheme ending with :\/\/
-                |                                                          # or
-                (?<scheme>mailto):                                         # mailto
+            (?:                                                      # scheme
+                (?<scheme>https?:)?                                  # Only consider http and https
+                \/\/                                                 # The protocol does not have to be there, but when
+                                                                     # it is, is must be followed by \/\/
             )?
             (?:                                                        # userinfo
                 (?:
@@ -108,7 +114,7 @@ class WP_URL_In_Text_Processor {
             (?=[^\p{Z}\p{Sm}\p{Sc}\p{Sk}\p{C}\p{P}])                   # followed by valid host char
             (?|                                                        # host
                 (?<host>                                                   # host prefixed by scheme or userinfo (less strict)
-                    (?<=\/{2}|@)                                               # prefixed with \/\/ or @
+                    (?<=\/\/|@)                                               # prefixed with \/\/ or @
                     (?=[^\-])                                                  # label start, not: -
                     (?:[^\p{Z}\p{Sm}\p{Sc}\p{Sk}\p{C}\p{P}]|-){1,63}           # label not: whitespace, mathematical, currency, modifier symbol, control point, punctuation | except -
                     (?<=[^\-])                                                 # label end, not: -
@@ -147,6 +153,8 @@ class WP_URL_In_Text_Processor {
 	 */
 	public function next_url() {
 		$this->url = null;
+		$this->url_starts_at = null;
+		$this->url_length = null;
 		while ( true ) {
 			$matches = [];
 			$found   = preg_match( $this->regex, $this->text, $matches, PREG_OFFSET_CAPTURE, $this->bytes_already_parsed );
@@ -161,6 +169,8 @@ class WP_URL_In_Text_Processor {
 			) {
 				$url = substr( $url, 0, - 1 );
 			}
+			$this->url_starts_at = $matches[0][1];
+			$this->url_length = strlen($matches[0][0]);
 			$this->bytes_already_parsed = $matches[0][1] + strlen( $url );
 
 			if ( ! URL::canParse( $url, $this->base_url ) ) {
@@ -181,8 +191,64 @@ class WP_URL_In_Text_Processor {
 	}
 
 	public function set_url( $new_url ) {
+		if ( null === $this->url ) {
+			return false;
+		}
+		$this->url = $new_url;
+		$this->lexical_updates[$this->url_starts_at] = new WP_HTML_Text_Replacement(
+			$this->url_starts_at,
+			$this->url_length,
+			$new_url
+		);
+		return true;
+	}
 
+	private function apply_lexical_updates() {
+		if ( ! count( $this->lexical_updates ) ) {
+			return 0;
+		}
 
+		$accumulated_shift_for_given_point = 0;
+
+		/*
+		 * Attribute updates can be enqueued in any order but updates
+		 * to the document must occur in lexical order; that is, each
+		 * replacement must be made before all others which follow it
+		 * at later string indices in the input document.
+		 *
+		 * Sorting avoid making out-of-order replacements which
+		 * can lead to mangled output, partially-duplicated
+		 * attributes, and overwritten attributes.
+		 */
+
+		ksort( $this->lexical_updates );
+
+		$bytes_already_copied = 0;
+		$output_buffer        = '';
+		foreach ( $this->lexical_updates as $diff ) {
+			$shift = strlen( $diff->text ) - $diff->length;
+
+			// Adjust the cursor position by however much an update affects it.
+			if ( $diff->start < $this->bytes_already_parsed ) {
+				$this->bytes_already_parsed += $shift;
+			}
+
+			$output_buffer       .= substr( $this->text, $bytes_already_copied, $diff->start - $bytes_already_copied );
+			if ( $diff->start === $this->url_starts_at ) {
+				$this->url_starts_at = strlen($output_buffer);
+				$this->url_length = strlen( $diff->text );
+			}
+			$output_buffer       .= $diff->text;
+			$bytes_already_copied = $diff->start + $diff->length;
+		}
+
+		$this->text = $output_buffer . substr( $this->text, $bytes_already_copied );
+		$this->lexical_updates = array();
+	}
+
+	public function get_updated_text(  ) {
+		$this->apply_lexical_updates();
+		return $this->text;
 	}
 
 }
