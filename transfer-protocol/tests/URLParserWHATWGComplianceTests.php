@@ -4,7 +4,7 @@ use Rowbot\URL\URL;
 use PHPUnit\Framework\TestCase;
 
 function load_test_examples() {
-    $json = file_get_contents(__DIR__ . '/urltestdata.json');
+    $json = file_get_contents(__DIR__ . '/whatwg_url_test_data.json');
     /**
      * Removes UTF-16 sequences from a JSON string since PHP doesn't know how to decode
      * them and returns null from json_decode.
@@ -25,7 +25,7 @@ function load_test_examples() {
     return json_decode($json, true);
 }
 
-class URL_Parser_WHATWG_Compliance_Tests extends TestCase
+class URLParserWHATWGComplianceTests extends TestCase
 {
 
     /**

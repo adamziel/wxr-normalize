@@ -7,7 +7,11 @@ use Rowbot\URL\URL;
  */
 class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 
-	private $url;
+	private $raw_url;
+	/**
+	 * @var URL
+	 */
+	private $parsed_url;
 	private $base_url;
 	private $url_in_text_processor;
 	private $url_in_text_node_updated;
@@ -27,14 +31,19 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 		return parent::get_updated_html();
 	}
 
-	public function get_url() {
-		return $this->url;
+	public function get_raw_url() {
+		return $this->raw_url;
+	}
+
+	public function get_parsed_url() {
+		return $this->parsed_url;
 	}
 
 	public function next_token() {
 		$this->get_updated_html();
 
-		$this->url                         = null;
+		$this->raw_url    = null;
+		$this->parsed_url = null;
 		$this->inspected_url_attribute_idx = - 1;
 		$this->url_in_text_processor       = null;
 		// Do not reset url_in_text_node_updated – it's reset in get_updated_html() which
@@ -54,7 +63,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 	}
 
 	public function next_url_in_current_token() {
-		$this->url = null;
+		$this->raw_url = null;
 		switch ( parent::get_token_type() ) {
 			case '#tag':
 				return $this->next_url_attribute();
@@ -68,17 +77,11 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 	}
 
 	private function next_url_in_text_node() {
-
 		if ( $this->get_token_type() !== '#text' ) {
 			return false;
 		}
 
 		if ( null === $this->url_in_text_processor ) {
-			$this->url_in_text_processor = new WP_Migration_URL_In_Text_Processor( $this->get_modifiable_text() );
-		}
-
-		while ( $this->url_in_text_processor->next_url() ) {
-			$url = $this->url_in_text_processor->get_url();
 			/*
 			 * Use the base URL for URLs matched in text nodes. This is the only
 			 * way to recognize a substring "WordPress.org" as a URL. We might
@@ -90,11 +93,14 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			 * to filter out such false positives e.g. by checking the domain against
 			 * a list of accepted domains, or the TLD against a list of public suffixes.
 			 */
-			if ( URL::canParse( $url, $this->base_url ) ) {
-				$this->url = $url;
+			$this->url_in_text_processor = new WP_Migration_URL_In_Text_Processor( $this->get_modifiable_text(), $this->base_url );
+		}
 
-				return true;
-			}
+		while ( $this->url_in_text_processor->next_url() ) {
+			$this->raw_url    = $this->url_in_text_processor->get_raw_url();
+			$this->parsed_url = $this->url_in_text_processor->get_parsed_url();
+
+			return true;
 		}
 
 		return false;
@@ -109,7 +115,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			return false;
 		}
 
-		while ( ++$this->inspected_url_attribute_idx < count( self::URL_ATTRIBUTES[ $tag ] ) ) {
+		while ( ++ $this->inspected_url_attribute_idx < count( self::URL_ATTRIBUTES[ $tag ] ) ) {
 			$attr = self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ];
 			if ( false === $attr ) {
 				return false;
@@ -123,10 +129,14 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			 * be correctly recognized as a URL.
 			 * Without a base URL, this Processor would incorrectly skip it.
 			 */
-			if ( is_string( $url_maybe ) && URL::canParse( $url_maybe, $this->base_url ) ) {
-				$this->url = $url_maybe;
+			if ( is_string( $url_maybe ) ) {
+				$parsed_url = WP_URL::parse( $url_maybe, $this->base_url );
+				if ( false !== $parsed_url ) {
+					$this->raw_url    = $url_maybe;
+					$this->parsed_url = $parsed_url;
 
-				return true;
+					return true;
+				}
 			}
 		}
 
@@ -143,18 +153,22 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			 * When a base URL is missing, the string must start with a protocol to
 			 * be considered a URL.
 			 */
-			if ( is_string( $url_maybe ) && URL::canParse( $url_maybe ) ) {
-				$this->url = $url_maybe;
+			if ( is_string( $url_maybe ) ) {
+				$parsed_url = WP_URL::parse( $url_maybe );
+				if ( false !== $parsed_url ) {
+					$this->raw_url    = $url_maybe;
+					$this->parsed_url = $parsed_url;
 
-				return true;
+					return true;
+				}
 			}
 		}
 
 		return false;
 	}
 
-	public function set_url( $new_url ) {
-		if ( null === $this->url ) {
+	public function set_raw_url( $new_url ) {
+		if ( null === $this->raw_url ) {
 			return false;
 		}
 		switch ( parent::get_token_type() ) {
@@ -176,7 +190,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 				}
 				$this->url_in_text_node_updated = true;
 
-				return $this->url_in_text_processor->set_url( $new_url );
+				return $this->url_in_text_processor->set_raw_url( $new_url );
 		}
 	}
 

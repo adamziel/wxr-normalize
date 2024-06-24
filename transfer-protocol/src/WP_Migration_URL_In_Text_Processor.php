@@ -1,9 +1,16 @@
 <?php
 
 /**
- * Finds potential URLs in text nodes.
+ * Finds string fragments that look like URLs and allow replacing them.
+ * This is the first, "thick" sieve that yields "URL candidates" that must be
+ * validated with a WHATWG-compliant parser. Some of the candidates will be
+ * false positives.
+ *
+ * This is a "thick sieve" that matches too much instead of too little. It
+ * will yield false positives, but will not miss a URL
  *
  * Looks for URLs:
+ *
  * * Starting with http:// or https://
  * * Starting with //
  * * Domain-only, e.g. www.example.com
@@ -56,39 +63,55 @@ class WP_Migration_URL_In_Text_Processor {
 	private $url_starts_at;
 	private $url_length;
 	private $bytes_already_parsed = 0;
-	private $url;
-	private $base_url = 'https://w.org';
+	/**
+	 * @var string
+	 */
+	private $raw_url;
+	/**
+	 * @var URL
+	 */
+	private $parsed_url;
+	private $did_prepend_protocol;
+	/**
+	 * The base URL for the parsing algorithm.
+	 * See https://url.spec.whatwg.org/.
+	 *
+	 * @var mixed|null
+	 */
+	private $base_url;
+	private $base_protocol;
+
+	/**
+	 * The regular expression pattern used for the matchin URL candidates
+	 * from the text.
+	 *
+	 * @var string
+	 */
 	private $regex;
+
+	/**
+	 * @see WP_HTML_Tag_Processor
+	 */
 	private $lexical_updates = array();
 
+	/**
+	 * @var bool
+	 * A flag to indicate whether the URL matching should be strict or not.
+	 * If set to true, the matching will be strict, meaning it will only match URLs that strictly adhere to the pattern.
+	 * If set to false, the matching will be more lenient, allowing for potential false positives.
+	 */
 	private $strict = false;
-
 	static private $public_suffix_list;
 
-	/**
-	 * Characters that are forbidden in the host part of a URL.
-	 * See https://url.spec.whatwg.org/#host-miscellaneous.
-	 */
-	private const FORBIDDEN_HOST_BYTES = "\x00\x09\x0a\x0d\x20\x23\x2f\x3a\x3c\x3e\x3f\x40\x5b\x5c\x5d\x5e\x7c";
-	private const FORBIDDEN_DOMAIN_BYTES = "\x00\x09\x0a\x0d\x20\x23\x25\x2f\x3a\x3c\x3e\x3f\x40\x5b\x5c\x5d\x5e\x7c\x7f";
-	/**
-	 * Unlike RFC 3986, the WHATWG URL specification does not the domain part of
-	 * a URL to any length. That being said, we apply an arbitrary limit here as
-	 * an optimization to avoid scanning the entire text for a domain name.
-	 *
-	 * Rationale: Domains larger than 1KB are extremely rare. The WHATWG URL
-	 */
-	private const CONSIDER_DOMAINS_UP_TO_BYTES = 1024;
 
-	public function __construct( $text ) {
+	public function __construct( $text, $base_url = null ) {
 		if ( ! self::$public_suffix_list ) {
+			// @TODO: Parse wildcards and exceptions from the public suffix list.
 			self::$public_suffix_list = require_once __DIR__ . '/public_suffix_list.php';
 		}
-		$this->text                 = $text;
-		// A reverse string is useful for lookups. It does not form a valid
-		// text since strrev doesn't support UTF-8, but that's okay. We're
-		// only interested in the byte positions.
-		// $this->text_rev = strrev($text);
+		$this->text          = $text;
+		$this->base_url      = $base_url;
+		$this->base_protocol = $base_url ? parse_url( $base_url, PHP_URL_SCHEME ) : null;
 
 		$prefix = $this->strict ? '^' : '';
 		$suffix = $this->strict ? '$' : '';
@@ -150,50 +173,112 @@ class WP_Migration_URL_In_Text_Processor {
 	 * @return string
 	 */
 	public function next_url() {
-		$this->url = null;
-		$this->url_starts_at = null;
-		$this->url_length = null;
+		$this->raw_url              = null;
+		$this->parsed_url           = null;
+		$this->url_starts_at        = null;
+		$this->url_length           = null;
+		$this->did_prepend_protocol = false;
 		while ( true ) {
+			/**
+			 * Thick sieve – eagerly match things that look like URLs but turn out to not be URLs in the end.
+			 */
 			$matches = [];
 			$found   = preg_match( $this->regex, $this->text, $matches, PREG_OFFSET_CAPTURE, $this->bytes_already_parsed );
 			if ( 1 !== $found ) {
 				return false;
 			}
 
-			$url = $matches[0][0];
+			$matched_url = $matches[0][0];
 			if (
-				$url[ strlen( $url ) - 1 ] === ')' ||
-				$url[ strlen( $url ) - 1 ] === '.'
+				$matched_url[ strlen( $matched_url ) - 1 ] === ')' ||
+				$matched_url[ strlen( $matched_url ) - 1 ] === '.'
 			) {
-				$url = substr( $url, 0, - 1 );
+				$matched_url = substr( $matched_url, 0, - 1 );
 			}
-			$this->url_starts_at = $matches[0][1];
-			$this->url_length = strlen($matches[0][0]);
-			$this->bytes_already_parsed = $matches[0][1] + strlen( $url );
+			$this->bytes_already_parsed = $matches[0][1] + strlen( $matched_url );
 
-			$this->url = $url;
+			$had_double_slash = WP_URL::has_double_slash( $matched_url );
+
+			$url_to_parse = $matched_url;
+			if ( $this->base_url && $this->base_protocol && ! $had_double_slash ) {
+				$url_to_parse               = WP_URL::ensure_protocol( $url_to_parse, $this->base_protocol );
+				$this->did_prepend_protocol = true;
+			}
+
+			/*
+			 * Extra fine sieve – parse the candidates using a WHATWG-compliant parser to rule out false positives.
+			 */
+			$parsed_url = WP_URL::parse( $url_to_parse, $this->base_url );
+			if ( false === $parsed_url ) {
+				continue;
+			}
+
+			// Additional rigor for URLs that are not explicitly preceded by a double slash.
+			if ( ! $had_double_slash ) {
+				/*
+				 * Skip TLDs that are not in the public suffix.
+				 * This reduces false positives like `index.html` or `plugins.php`.
+				 *
+				 * See https://publicsuffix.org/.
+				 */
+				$last_dot_position = strrpos( $parsed_url->hostname, '.' );
+				if ( false === $last_dot_position ) {
+					/*
+					 * Oh, there was no dot in the hostname AND no double slash at
+					 * the beginning! Let's assume this isn't a valid URL and move on.
+					 * @TODO: Explore updating the regular expression above to avoid matching
+					 *        URLs without a dot in the hostname when they're not preceeded
+					 *        by a protocol.
+					 */
+					continue;
+				}
+
+				$tld = substr( $parsed_url->hostname, $last_dot_position + 1 );
+				if ( empty( self::$public_suffix_list[ $tld ] ) ) {
+					// This TLD is not in the public suffix list. It's not a valid domain name.
+					continue;
+				}
+			}
+
+			$this->parsed_url    = $parsed_url;
+			$this->raw_url       = $matched_url;
+			$this->url_starts_at = $matches[0][1];
+			$this->url_length    = strlen( $matches[0][0] );
+
 			return true;
 		}
 	}
 
-	public function get_url() {
-		if ( null === $this->url ) {
+	public function get_raw_url() {
+		if ( null === $this->raw_url ) {
 			return false;
 		}
 
-		return $this->url;
+		return $this->raw_url;
 	}
 
-	public function set_url( $new_url ) {
-		if ( null === $this->url ) {
+	public function get_parsed_url() {
+		if ( null === $this->parsed_url ) {
 			return false;
 		}
-		$this->url = $new_url;
-		$this->lexical_updates[$this->url_starts_at] = new WP_HTML_Text_Replacement(
+
+		return $this->parsed_url;
+	}
+
+	public function set_raw_url( $new_url ) {
+		if ( null === $this->raw_url ) {
+			return false;
+		}
+		if ( $this->did_prepend_protocol ) {
+			$new_url = substr( $new_url, strpos( $new_url, '://' ) + 3 );
+		}
+		$this->raw_url                                 = $new_url;
+		$this->lexical_updates[ $this->url_starts_at ] = new WP_HTML_Text_Replacement(
 			$this->url_starts_at,
 			$this->url_length,
 			$new_url
 		);
+
 		return true;
 	}
 
@@ -201,8 +286,6 @@ class WP_Migration_URL_In_Text_Processor {
 		if ( ! count( $this->lexical_updates ) ) {
 			return 0;
 		}
-
-		$accumulated_shift_for_given_point = 0;
 
 		/*
 		 * Attribute updates can be enqueued in any order but updates
@@ -227,100 +310,126 @@ class WP_Migration_URL_In_Text_Processor {
 				$this->bytes_already_parsed += $shift;
 			}
 
-			$output_buffer       .= substr( $this->text, $bytes_already_copied, $diff->start - $bytes_already_copied );
+			$output_buffer .= substr( $this->text, $bytes_already_copied, $diff->start - $bytes_already_copied );
 			if ( $diff->start === $this->url_starts_at ) {
-				$this->url_starts_at = strlen($output_buffer);
-				$this->url_length = strlen( $diff->text );
+				$this->url_starts_at = strlen( $output_buffer );
+				$this->url_length    = strlen( $diff->text );
 			}
-			$output_buffer       .= $diff->text;
+			$output_buffer        .= $diff->text;
 			$bytes_already_copied = $diff->start + $diff->length;
 		}
 
-		$this->text = $output_buffer . substr( $this->text, $bytes_already_copied );
+		$this->text            = $output_buffer . substr( $this->text, $bytes_already_copied );
 		$this->lexical_updates = array();
 	}
 
-	public function get_updated_text(  ) {
+	public function get_updated_text() {
 		$this->apply_lexical_updates();
+
 		return $this->text;
 	}
 
+	/**
+	 * Characters that are forbidden in the host part of a URL.
+	 * See https://url.spec.whatwg.org/#host-miscellaneous.
+	 */
+	private const FORBIDDEN_HOST_BYTES = "\x00\x09\x0a\x0d\x20\x23\x2f\x3a\x3c\x3e\x3f\x40\x5b\x5c\x5d\x5e\x7c";
+	private const FORBIDDEN_DOMAIN_BYTES = "\x00\x09\x0a\x0d\x20\x23\x25\x2f\x3a\x3c\x3e\x3f\x40\x5b\x5c\x5d\x5e\x7c\x7f";
+	/**
+	 * Unlike RFC 3986, the WHATWG URL specification does not the domain part of
+	 * a URL to any length. That being said, we apply an arbitrary limit here as
+	 * an optimization to avoid scanning the entire text for a domain name.
+	 *
+	 * Rationale: Domains larger than 1KB are extremely rare. The WHATWG URL
+	 */
+	private const CONSIDER_DOMAINS_UP_TO_BYTES = 1024;
+
+	/**
+	 * An exploration to match URLs without using regular expressions.
+	 * Need to benchmark and rigorously test the current next_url()
+	 * implementation. We may either:
+	 *
+	 * * Be fine with preg_match in next_url()
+	 * * Need a custom implementation like this one
+	 * * Be forced to ditch this approach entirely and find a way to plug
+	 *   in a proper WHATWG-compliant URL parser into the task of finding
+	 *   URLs in text. This may or may not be possible/viable.
+	 * @wip
+	 */
+	private function experimental_next_url_without_regexs() {
+		$at = $this->bytes_already_parsed;
+
+		// Find the next dot in the text
+		$dot_at = strpos( $this->text, '.', $at );
+
+		// If there's no dot, assume there's no URL
+		if ( false === $dot_at ) {
+			return false;
+		}
+
+		// The shortest tld is 2 characters long
+		if ( $dot_at + 2 >= strlen( $this->text ) ) {
+			return false;
+		}
+
+		$host_bytes_after_dot = strcspn(
+			$this->text,
+			self::FORBIDDEN_DOMAIN_BYTES,
+			$dot_at + 1,
+			self::CONSIDER_DOMAINS_UP_TO_BYTES
+		);
+
+		if ( 0 === $host_bytes_after_dot ) {
+			return false;
+		}
+
+		// Lookbehind to capture the rest of the domain name up to a forbidden character.
+		$host_bytes_before_dot = strcspn(
+			$this->text_rev,
+			self::FORBIDDEN_DOMAIN_BYTES,
+			strlen( $this->text ) - $dot_at - 1,
+			self::CONSIDER_DOMAINS_UP_TO_BYTES
+		);
+
+		$host_starts_at = $dot_at - $host_bytes_before_dot;
+
+		// Capture the protocol, if any
+		$has_double_slash = false;
+		if ( $host_starts_at > 2 ) {
+			if ( '/' === $this->text[ $host_starts_at - 1 ] && '/' === $this->text[ $host_starts_at - 2 ] ) {
+				$has_double_slash = true;
+			}
+		}
+
+		/**
+		 * Look for http or https at the beginning of the URL.
+		 * @TODO: Ensure the character before http or https is a word boundary.
+		 */
+		$has_protocol = false;
+		if ( $has_double_slash && (
+				(
+					$host_starts_at >= 6 &&
+					'h' === $this->text[ $host_starts_at - 6 ] &&
+					't' === $this->text[ $host_starts_at - 5 ] &&
+					't' === $this->text[ $host_starts_at - 4 ] &&
+					'p' === $this->text[ $host_starts_at - 3 ]
+				) ||
+				(
+					$host_starts_at >= 7 &&
+					'h' === $this->text[ $host_starts_at - 7 ] &&
+					't' === $this->text[ $host_starts_at - 6 ] &&
+					't' === $this->text[ $host_starts_at - 5 ] &&
+					'p' === $this->text[ $host_starts_at - 4 ] &&
+					's' === $this->text[ $host_starts_at - 3 ]
+				)
+			) ) {
+			$has_protocol = true;
+		}
+
+		// Move the pointer to the end of the host
+		$at = $dot_at + $host_bytes_after_dot;
+	}
+
+
 }
 
-
-//public function next_url_2() {
-//	$at = $this->bytes_already_parsed;
-//
-//	// Find the next dot in the text
-//	$dot_at = strpos($this->text, '.', $at);
-//
-//	// If there's no dot, assume there's no URL
-//	if(false === $dot_at) {
-//		return false;
-//	}
-//
-//	// The shortest tld is 2 characters long
-//	if($dot_at + 2 >= strlen($this->text)) {
-//		return false;
-//	}
-//
-//	$host_bytes_after_dot = strcspn(
-//		$this->text,
-//		self::FORBIDDEN_DOMAIN_BYTES,
-//		$dot_at + 1,
-//		self::CONSIDER_DOMAINS_UP_TO_BYTES
-//	);
-//
-//	if(0 === $host_bytes_after_dot) {
-//		return false;
-//	}
-//
-//	// Lookbehind to capture the rest of the domain name up to a forbidden character.
-//	$host_bytes_before_dot = strcspn(
-//		$this->text_rev,
-//		self::FORBIDDEN_DOMAIN_BYTES,
-//		strlen($this->text) - $dot_at - 1,
-//		self::CONSIDER_DOMAINS_UP_TO_BYTES
-//	);
-//
-//	$host_starts_at = $dot_at - $host_bytes_before_dot;
-//
-//	// Capture the protocol, if any
-//	$has_double_slash = false;
-//	if($host_starts_at > 2) {
-//		if ( '/' === $this->text[ $host_starts_at - 1 ] && '/' === $this->text[ $host_starts_at - 2 ] ) {
-//			$has_double_slash = true;
-//		}
-//	}
-//
-//	/**
-//	 * Look for http or https at the beginning of the URL.
-//	 * @TODO: Ensure the character before http or https is a word boundary.
-//	 */
-//	$has_protocol = false;
-//	if($has_double_slash && (
-//			(
-//				$host_starts_at >= 6 &&
-//				'h' === $this->text[$host_starts_at - 6] &&
-//				't' === $this->text[$host_starts_at - 5] &&
-//				't' === $this->text[$host_starts_at - 4] &&
-//				'p' === $this->text[$host_starts_at - 3]
-//			) ||
-//			(
-//				$host_starts_at >= 7 &&
-//				'h' === $this->text[$host_starts_at - 7] &&
-//				't' === $this->text[$host_starts_at - 6] &&
-//				't' === $this->text[$host_starts_at - 5] &&
-//				'p' === $this->text[$host_starts_at - 4] &&
-//				's' === $this->text[$host_starts_at - 3]
-//			)
-//		)) {
-//		$has_protocol = true;
-//	}
-//
-//	// Move the pointer to the end of the host
-//	$at = $dot_at + $host_bytes_after_dot;
-//
-//
-//
-//}

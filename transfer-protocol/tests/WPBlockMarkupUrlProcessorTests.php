@@ -2,7 +2,7 @@
 
 use PHPUnit\Framework\TestCase;
 
-class WP_Block_Markup_Url_Processor_Tests extends TestCase
+class WPBlockMarkupUrlProcessorTests extends TestCase
 {
 
     public function test_next_url_in_current_token_returns_false_when_no_url_is_found()
@@ -19,7 +19,7 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
     {
         $p = new WP_Block_Markup_Url_Processor($markup, $base_url);
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals($url, $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.');
+		$this->assertEquals($url, $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.');
     }
 
     static public function provider_test_finds_next_url()
@@ -87,23 +87,23 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 		$markup = '<img longdesc="https://first-url.org" src="https://mysite.com/wp-content/image.png">';
 		$p = new WP_Block_Markup_Url_Processor( $markup );
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals( 'https://first-url.org', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+		$this->assertEquals( 'https://first-url.org', $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
 
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals( 'https://mysite.com/wp-content/image.png', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+		$this->assertEquals( 'https://mysite.com/wp-content/image.png', $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
 	}
 
 	public function test_next_url_finds_urls_in_multiple_tags(  ) {
 		$markup = '<img longdesc="https://first-url.org" src="https://mysite.com/wp-content/image.png"><a href="https://third-url.org">';
 		$p = new WP_Block_Markup_Url_Processor( $markup );
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals( 'https://first-url.org', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+		$this->assertEquals( 'https://first-url.org', $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
 
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals( 'https://mysite.com/wp-content/image.png', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+		$this->assertEquals( 'https://mysite.com/wp-content/image.png', $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
 
 		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
-		$this->assertEquals( 'https://third-url.org', $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
+		$this->assertEquals( 'https://third-url.org', $p->get_raw_url(), 'Found a URL in the markup, but it wasn\'t the expected one.' );
 	}
 
 	/**
@@ -114,7 +114,7 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 	{
 		$p = new WP_Block_Markup_Url_Processor($markup);
 		$this->assertTrue($p->next_url(), 'Failed to find the URL in the markup.');
-		$this->assertTrue($p->set_url($new_url), 'Failed to set the URL in the markup.');
+		$this->assertTrue($p->set_raw_url($new_url), 'Failed to set the URL in the markup.');
 		$this->assertEquals($new_markup, $p->get_updated_html(), 'Failed to set the URL in the markup.');
 	}
 
@@ -163,7 +163,7 @@ HTML,
 
 		// Replace every url with 'https://site-export.internal'
 		while($p->next_url()) {
-			$p->set_url('https://site-export.internal');
+			$p->set_raw_url('https://site-export.internal');
 		}
 
 		$this->assertEquals(
@@ -178,8 +178,8 @@ HTML,
 
 <!-- wp:paragraph -->
 <p>
-Have you seen my blog, https://site-export.internal? I told a story there of how I got my Bachelor's degree,
-check it out: https://site-export.internal
+Have you seen my blog, site-export.internal? I told a story there of how I got my Bachelor's degree,
+check it out: site-export.internal
 </p>
 <!-- /wp:paragraph -->
 HTML,

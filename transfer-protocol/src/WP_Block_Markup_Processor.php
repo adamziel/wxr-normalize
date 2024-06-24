@@ -144,31 +144,6 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 		return $this->block_attributes;
 	}
 
-	public function set_block_attributes( array $new_attributes ) {
-		if ( null === $this->block_name ) {
-			_doing_it_wrong(
-				__METHOD__,
-				__( 'Cannot set block attributes when not in `block_attributes` state' ),
-				'WP_VERSION'
-			);
-
-			return false;
-		}
-
-		if ( null !== $this->block_attributes_iterator ) {
-			_doing_it_wrong(
-				__METHOD__,
-				__( 'Cannot override all the block attributes when iterating over the existing attributes with next_block_attribute()' ),
-				'WP_VERSION'
-			);
-
-			return false;
-		}
-
-		$this->block_attributes_updated = true;
-		$this->block_attributes         = $new_attributes;
-	}
-
 	public function is_block_closer() {
 		return $this->block_name !== null && $this->block_closer === true;
 	}

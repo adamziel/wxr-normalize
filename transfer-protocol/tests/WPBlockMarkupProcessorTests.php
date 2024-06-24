@@ -2,7 +2,7 @@
 
 use PHPUnit\Framework\TestCase;
 
-class WP_Block_Markup_Processor_Tests extends TestCase {
+class WPBlockMarkupProcessorTests extends TestCase {
 
 	/**
 	 *
