@@ -75,9 +75,7 @@ switch ( $command ) {
 		$string_new_site_url           = $options['new-site-url'];
 		$parsed_new_site_url     = WP_URL::parse( $string_new_site_url );
 
-		echo "Replacing $base_url with $string_new_site_url in the input.\n";
-		echo "Note this is not yet enough to migrate the site as both the previous and the new";
-		echo "site might be hosted on specific paths.\n\n";
+		echo "Replacing $base_url with $string_new_site_url in the input.\n\n";
 		while ( $p->next_url() ) {
 			$updated            = false;
 			$matched_url        = $p->get_raw_url();
