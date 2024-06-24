@@ -22,7 +22,6 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 		if ( $this->url_in_text_node_updated ) {
 			$this->set_modifiable_text( $this->url_in_text_processor->get_updated_text() );
 			$this->url_in_text_node_updated = false;
-			$this->url_in_text_processor    = null;
 		}
 
 		return parent::get_updated_html();
@@ -33,8 +32,11 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 	}
 
 	public function next_token() {
-		$this->url                      = null;
+		$this->get_updated_html();
+
+		$this->url                         = null;
 		$this->inspected_url_attribute_idx = - 1;
+		$this->url_in_text_processor       = null;
 		// Do not reset url_in_text_node_updated – it's reset in get_updated_html() which
 		// is called in parent::next_token().
 
@@ -43,7 +45,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 
 	public function next_url() {
 		do {
-			if ( true === $this->next_url_in_current_token() ) {
+			if ( $this->next_url_in_current_token() ) {
 				return true;
 			}
 		} while ( $this->next_token() !== false );
@@ -52,6 +54,7 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 	}
 
 	public function next_url_in_current_token() {
+		$this->url = null;
 		switch ( parent::get_token_type() ) {
 			case '#tag':
 				return $this->next_url_attribute();
@@ -59,10 +62,13 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 				return $this->next_url_block_attribute();
 			case '#text':
 				return $this->next_url_in_text_node();
+			default:
+				return false;
 		}
 	}
 
-	public function next_url_in_text_node() {
+	private function next_url_in_text_node() {
+
 		if ( $this->get_token_type() !== '#text' ) {
 			return false;
 		}
@@ -71,13 +77,27 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			$this->url_in_text_processor = new WP_Migration_URL_In_Text_Processor( $this->get_modifiable_text() );
 		}
 
-		if ( ! $this->url_in_text_processor->next_url() ) {
-			return false;
+		while ( $this->url_in_text_processor->next_url() ) {
+			$url = $this->url_in_text_processor->get_url();
+			/*
+			 * Use the base URL for URLs matched in text nodes. This is the only
+			 * way to recognize a substring "WordPress.org" as a URL. We might
+			 * get some false positives this way, e.g. in this string:
+			 *
+			 * > And that's how you build a theme.Now let's take a look at..."
+			 *
+			 * `theme.Now` would be recognized as a URL. It's up to the API consumer
+			 * to filter out such false positives e.g. by checking the domain against
+			 * a list of accepted domains, or the TLD against a list of public suffixes.
+			 */
+			if ( URL::canParse( $url, $this->base_url ) ) {
+				$this->url = $url;
+
+				return true;
+			}
 		}
 
-		$this->url = $this->url_in_text_processor->get_url();
-
-		return true;
+		return false;
 	}
 
 	private function next_url_attribute() {
@@ -89,34 +109,47 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 			return false;
 		}
 
-		while ( true ) {
-			++ $this->inspected_url_attribute_idx;
-			if ( $this->inspected_url_attribute_idx >= count( self::URL_ATTRIBUTES[ $tag ] ) ) {
+		while ( ++$this->inspected_url_attribute_idx < count( self::URL_ATTRIBUTES[ $tag ] ) ) {
+			$attr = self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ];
+			if ( false === $attr ) {
 				return false;
 			}
-			$this->url = $this->get_attribute(
-				self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ]
-			);
-			if ( $this->url !== null ) {
-				break;
-			}
-		}
 
-		if ( null === $this->url ) {
-			return false;
-		}
+			$url_maybe = $this->get_attribute( $attr );
+			/*
+			 * Use base URL to resolve known URI attributes as we are certain we're
+			 * dealing with URI values.
+			 * With a base URL, the string "plugins.php" in <a href="plugins.php"> will
+			 * be correctly recognized as a URL.
+			 * Without a base URL, this Processor would incorrectly skip it.
+			 */
+			if ( is_string( $url_maybe ) && URL::canParse( $url_maybe, $this->base_url ) ) {
+				$this->url = $url_maybe;
 
-		return true;
-	}
-
-	private function next_url_block_attribute() {
-		while($this->next_block_attribute()){
-			$url_maybe = $this->get_block_attribute_value();
-			if ( URL::canParse( $url_maybe, $this->base_url ) ) {
-				$this->url                           = $url_maybe;
 				return true;
 			}
 		}
+
+		return false;
+	}
+
+	private function next_url_block_attribute() {
+		while ( $this->next_block_attribute() ) {
+			$url_maybe = $this->get_block_attribute_value();
+			/*
+			 * Do not use base URL for block attributes. to avoid false positives.
+			 * When a base URL is present, any word is a valid URL relative to the
+			 * base URL.
+			 * When a base URL is missing, the string must start with a protocol to
+			 * be considered a URL.
+			 */
+			if ( is_string( $url_maybe ) && URL::canParse( $url_maybe ) ) {
+				$this->url = $url_maybe;
+
+				return true;
+			}
+		}
+
 		return false;
 	}
 
@@ -126,17 +159,11 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 		}
 		switch ( parent::get_token_type() ) {
 			case '#tag':
-				$tag = $this->get_tag();
-				if ( ! array_key_exists( $tag, self::URL_ATTRIBUTES ) ) {
+				$attr = $this->get_inspected_attribute_name();
+				if ( false === $attr ) {
 					return false;
 				}
-				if ( ! array_key_exists( $this->inspected_url_attribute_idx, self::URL_ATTRIBUTES[ $tag ] ) ) {
-					return false;
-				}
-				$this->set_attribute(
-					self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ],
-					$new_url
-				);
+				$this->set_attribute( $attr, $new_url );
 
 				return true;
 
@@ -148,8 +175,29 @@ class WP_Block_Markup_Url_Processor extends WP_Block_Markup_Processor {
 					return false;
 				}
 				$this->url_in_text_node_updated = true;
+
 				return $this->url_in_text_processor->set_url( $new_url );
 		}
+	}
+
+	public function get_inspected_attribute_name() {
+		if ( '#tag' !== $this->get_token_type() ) {
+			return false;
+		}
+
+		$tag = $this->get_tag();
+		if ( ! array_key_exists( $tag, self::URL_ATTRIBUTES ) ) {
+			return false;
+		}
+
+		if (
+			$this->inspected_url_attribute_idx < 0 ||
+			$this->inspected_url_attribute_idx >= count( self::URL_ATTRIBUTES[ $tag ] )
+		) {
+			return false;
+		}
+
+		return self::URL_ATTRIBUTES[ $tag ][ $this->inspected_url_attribute_idx ];
 	}
 
 

@@ -134,6 +134,12 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 				'<p>I am a new text</p>',
 				2,
 			],
+			'Escapes the text in a text node' => [
+				'<p>Hello, there</p>',
+				'The <div> tag is my favorite one',
+				'<p>The &lt;div&gt; tag is my favorite one</p>',
+				2,
+			],
 		];
 	}
 
@@ -174,6 +180,16 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		);
 	}
 
+	public function test_next_block_attribute_returns_false_after_the_last_attribute() {
+		$p = new WP_Block_Markup_Processor(
+			'<!-- wp:image {"class": "wp-bold", "id": "New York City" } -->'
+		);
+		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
+		$this->assertFalse( $p->next_block_attribute(), 'Returned true even though there was no next attribute' );
+	}
+
 	public function test_next_block_attribute_finds_the_first_attribute() {
 		$p = new WP_Block_Markup_Processor(
 			'<!-- wp:image {"class": "wp-bold", "id": "New York City" } -->'
@@ -204,6 +220,7 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
 
 		$this->assertEquals( 'lowres', $p->get_block_attribute_key(), 'Failed to find the block attribute name' );
 		$this->assertEquals( 'small.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
@@ -214,6 +231,24 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertEquals( 'large.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
 	}
 
+	public function test_next_block_attribute_loops_over_lists() {
+		$p = new WP_Block_Markup_Processor(
+			'<!-- wp:image {"class": "wp-bold", "sources": ["small.png", "large.png"] } -->'
+		);
+		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
+
+		$this->assertEquals( 0, $p->get_block_attribute_key(), 'Failed to find the block attribute name' );
+		$this->assertEquals( 'small.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
+
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+
+		$this->assertEquals( 1, $p->get_block_attribute_key(), 'Failed to find the block attribute name' );
+		$this->assertEquals( 'large.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
+	}
+
 	public function test_next_block_attribute_finds_top_level_attributes_after_nesting() {
 		$p = new WP_Block_Markup_Processor(
 			'<!-- wp:image {"sources": { "lowres": "small.png", "hires": "large.png" }, "class": "wp-bold" } -->'
@@ -221,7 +256,8 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
-		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the fourth block attribute' );
 
 		$this->assertEquals( 'class', $p->get_block_attribute_key(), 'Failed to find the block attribute name' );
 		$this->assertEquals( 'wp-bold', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
@@ -235,7 +271,7 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
 
 		$p->set_block_attribute_value( 'wp-italics' );
-		$this->assertEquals( '<!-- wp:image {"class": "wp-italics"} -->', $p->get_updated_html(),
+		$this->assertEquals( '<!-- wp:image {"class":"wp-italics"} -->', $p->get_updated_html(),
 			'Failed to update the block attribute value' );
 	}
 
@@ -257,10 +293,26 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
 
 		$p->set_block_attribute_value( 'medium.png' );
 		$this->assertEquals( 'medium.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
-		$this->assertEquals( '<!-- wp:image {"sources": { "lowres": "small.png", "hires": "medium.png" } } -->', $p->get_updated_html(),
+		$this->assertEquals( '<!-- wp:image {"sources":{"lowres":"small.png","hires":"medium.png"}} -->', $p->get_updated_html(),
+			'Failed to update the block attribute value' );
+	}
+
+	public function test_set_block_attribute_value_updates_a_list_value() {
+		$p = new WP_Block_Markup_Processor(
+			'<!-- wp:image {"sources": ["small.png", "large.png"] } -->'
+		);
+		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
+
+		$p->set_block_attribute_value( 'medium.png' );
+		$this->assertEquals( 'medium.png', $p->get_block_attribute_value(), 'Failed to find the block attribute value' );
+		$this->assertEquals( '<!-- wp:image {"sources":["small.png","medium.png"]} -->', $p->get_updated_html(),
 			'Failed to update the block attribute value' );
 	}
 
@@ -271,16 +323,31 @@ class WP_Block_Markup_Processor_Tests extends TestCase {
 		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
 		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the second block attribute' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the third block attribute' );
 
 		$p->set_block_attribute_value( 'medium.png' );
 		$p->set_block_attribute_value( 'oh-completely-different-image.png' );
 		$this->assertEquals( 'oh-completely-different-image.png', $p->get_block_attribute_value(),
 			'Failed to find the block attribute value' );
 		$this->assertEquals(
-			'<!-- wp:image {"sources": { "lowres": "small.png", "hires": "oh-completely-different-image.png" } } -->',
+			'<!-- wp:image {"sources":{"lowres":"small.png","hires":"oh-completely-different-image.png"}} -->',
 			$p->get_updated_html(),
 			'Failed to update the block attribute value'
 		);
 	}
 
+	public function test_set_block_attribute_value_flushes_updates_on_next_token() {
+		$p = new WP_Block_Markup_Processor(
+			'<!-- wp:paragraph {"class": "wp-bold"} -->Hello, there'
+		);
+		$this->assertTrue( $p->next_token(), 'Failed to find the block opener' );
+		$this->assertTrue( $p->next_block_attribute(), 'Failed to find the first block attribute' );
+		$this->assertTrue( $p->set_block_attribute_value( 'wp-italics' ), 'Failed to update the block attribute value' );
+		$this->assertTrue( $p->next_token(), 'Failed to find the text node' );
+		$this->assertEquals(
+			'<!-- wp:paragraph {"class":"wp-italics"} -->Hello, there',
+			$p->get_updated_html(),
+			'Failed to update the block attribute value'
+		);
+	}
 }

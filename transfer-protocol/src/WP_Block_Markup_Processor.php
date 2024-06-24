@@ -29,9 +29,10 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 	private $accessible_text_starts_at;
 	private $accessible_text_length;
 	private $accessible_lexical_updates;
+
 	public function __construct( $html ) {
 		parent::__construct( $html );
-		$reflection                = new ReflectionClass( 'WP_HTML_Tag_Processor' );
+		$reflection = new ReflectionClass( 'WP_HTML_Tag_Processor' );
 
 		$this->accessible_text_starts_at = $reflection->getProperty( 'text_starts_at' );
 		$this->accessible_text_starts_at->setAccessible( true );
@@ -154,6 +155,16 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 			return false;
 		}
 
+		if ( null !== $this->block_attributes_iterator ) {
+			_doing_it_wrong(
+				__METHOD__,
+				__( 'Cannot override all the block attributes when iterating over the existing attributes with next_block_attribute()' ),
+				'WP_VERSION'
+			);
+
+			return false;
+		}
+
 		$this->block_attributes_updated = true;
 		$this->block_attributes         = $new_attributes;
 	}
@@ -163,11 +174,14 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 	}
 
 	public function next_token() {
+		$this->get_updated_html();
+
 		$this->block_name               = null;
 		$this->block_attributes         = null;
 		$this->block_closer             = false;
 		$this->block_attributes_updated = false;
-		$this->modifiable_text_updated = false;
+		$this->modifiable_text          = null;
+		$this->modifiable_text_updated  = false;
 
 		if ( parent::next_token() === false ) {
 			return false;
@@ -254,33 +268,46 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 
 	public function get_updated_html() {
 		$this->block_attribute_updates_to_modifiable_text_updates();
-		if ( $this->modifiable_text_updated ) {
-			$this->modifiable_text_updates_to_lexical_updates();
-			// @TODO: Remove return true, why does it matter here?
-			return true;
+		$new_text_length = $this->modifiable_text_updates_to_lexical_updates();
+		$text_starts_at  = $this->accessible_text_starts_at->getValue( $this );
+
+		$updated_html = parent::get_updated_html();
+
+		if ( false !== $new_text_length ) {
+			/**
+			 * Correct the invalid text indices moved by WP_HTML_Tag_Processor when
+			 * updating the modifiable text.
+			 * @TODO: Fix that directly in the WP_HTML_Tag_Processor.
+			 */
+			$this->accessible_text_length->setValue( $this, $new_text_length );
+			$this->accessible_text_starts_at->setValue( $this, $text_starts_at );
 		}
 
-		return parent::get_updated_html();
+		return $updated_html;
 	}
 
-	private function block_attribute_updates_to_modifiable_text_updates(  ) {
+	private function block_attribute_updates_to_modifiable_text_updates() {
 		// Apply block attribute updates, if any.
 		if ( ! $this->block_attributes_updated ) {
 			return false;
 		}
 		$this->set_modifiable_text(
+			' ' .
 			$this->block_name . ' ' .
 			json_encode(
-				$this->block_attributes,
+				$this->block_attributes_iterator
+					? $this->block_attributes_iterator->getSubIterator( 0 )->getArrayCopy()
+					: $this->block_attributes,
 				JSON_HEX_TAG | // Convert < and > to \u003C and \u003E
 				JSON_HEX_AMP   // Convert & to \u0026
 			)
+			. ' '
 		);
+
 		return true;
 	}
 
-	private function modifiable_text_updates_to_lexical_updates(  ) {
-
+	private function modifiable_text_updates_to_lexical_updates() {
 		/**
 		 * Applies modifiable text updates, if any.
 		 *
@@ -288,32 +315,39 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 		 * WP_HTML_Tag_Processor class to enable changing the text content of a
 		 * node.
 		 */
-		if ( $this->modifiable_text_updated ) {
-			$new_value                 = $this->get_modifiable_text();
-			switch ( parent::get_token_type() ) {
-				case '#text':
-					$lexical_updates_now   = $this->accessible_lexical_updates->getValue( $this );
-					$lexical_updates_now[] = new WP_HTML_Text_Replacement(
-						$this->accessible_text_starts_at->getValue( $this ),
-						$this->accessible_text_length->getValue( $this ),
-						htmlspecialchars( $new_value, ENT_XML1, 'UTF-8' )
-					);
-					$this->accessible_lexical_updates->setValue( $this, $lexical_updates_now );
-					return true;
-
-				case '#comment':
-				case '#cdata-section':
-					$lexical_updates_now   = $this->accessible_lexical_updates->getValue( $this );
-					$lexical_updates_now[] = new WP_HTML_Text_Replacement(
-						$this->accessible_text_starts_at->getValue( $this ),
-						$this->accessible_text_length->getValue( $this ),
-						$new_value
-					);
-					$this->accessible_lexical_updates->setValue( $this, $lexical_updates_now );
-					return true;
-			}
-			$this->modifiable_text_updated = false;
+		if ( ! $this->modifiable_text_updated ) {
+			return false;
 		}
+
+		$new_value = $this->get_modifiable_text();
+		switch ( parent::get_token_type() ) {
+			case '#text':
+				$lexical_updates_now   = $this->accessible_lexical_updates->getValue( $this );
+				$lexical_updates_now[] = new WP_HTML_Text_Replacement(
+					$this->accessible_text_starts_at->getValue( $this ),
+					$this->accessible_text_length->getValue( $this ),
+					htmlspecialchars( $new_value, ENT_XML1, 'UTF-8' )
+				);
+				$this->accessible_lexical_updates->setValue( $this, $lexical_updates_now );
+				break;
+
+			case '#comment':
+			case '#cdata-section':
+				$lexical_updates_now   = $this->accessible_lexical_updates->getValue( $this );
+				$lexical_updates_now[] = new WP_HTML_Text_Replacement(
+					$this->accessible_text_starts_at->getValue( $this ),
+					$this->accessible_text_length->getValue( $this ),
+					$new_value
+				);
+				$this->accessible_lexical_updates->setValue( $this, $lexical_updates_now );
+				break;
+
+			default:
+				return false;
+		}
+		$this->modifiable_text_updated = false;
+
+		return strlen( $new_value );
 	}
 
 	public function next_block_attribute() {
@@ -329,19 +363,15 @@ class WP_Block_Markup_Processor extends WP_HTML_Tag_Processor {
 			// Re-entrant iteration over the block attributes.
 			$this->block_attributes_iterator = new \RecursiveIteratorIterator(
 				new \RecursiveArrayIterator( $block_attributes ),
-				\RecursiveIteratorIterator::SELF_FIRST,
-				\RecursiveIteratorIterator::LEAVES_ONLY
+				\RecursiveIteratorIterator::SELF_FIRST
 			);
 		}
 
-		while ( $this->block_attributes_iterator->valid() ) {
+		while ( true ) {
 			$this->block_attributes_iterator->next();
-			// Skip nested arrays, we're about to descent into them anyway.
-			// @TODO: Investigate why LEAVES_ONLY isn't enough
-			if ( is_array( $this->block_attributes_iterator->current() ) ) {
-				continue;
+			if ( ! $this->block_attributes_iterator->valid() ) {
+				break;
 			}
-
 			return true;
 		}
 

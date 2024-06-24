@@ -2,51 +2,23 @@
 
 use PHPUnit\Framework\TestCase;
 
-//$block_markup = file_get_contents( __DIR__ . '/../married.html' );
-//
-//$p = new URL_Rewriter( $block_markup );
-//$p->next_url();
-
-// for ($i = 0; $i < 15; $i++) {
-//     $p->next_token();
-//     if($p->get_token_type() === '#block-comment') {
-//         $updated_attrs = map_block_attributes($p->get_block_attributes(), function($key, $value) {
-//             if($key === 'url') {
-//                 return 'https://example.com';
-//             }
-//             return $value;
-//         });
-//         $p->set_block_attributes($updated_attrs);
-//         echo substr($p->get_updated_html(), 0, 100) . "\n";
-//         die();
-//     }
-// }
-
-//private function map_block_attributes( array $attributes, $mapper ) {
-//	$new_attributes = array();
-//	foreach ( $attributes as $key => $value ) {
-//		if ( is_array( $value ) ) {
-//			$new_attributes[ $key ] = map_block_attributes( $value, $mapper );
-//		} else {
-//			$new_attributes[ $key ] = $mapper( $key, $value );
-//		}
-//	}
-//
-//	return $new_attributes;
-//}
-
-
 class WP_Block_Markup_Url_Processor_Tests extends TestCase
 {
+
+    public function test_next_url_in_current_token_returns_false_when_no_url_is_found()
+    {
+        $p = new WP_Block_Markup_Url_Processor('Text without URLs');
+		$this->assertFalse( $p->next_url_in_current_token() );
+    }
 
     /**
      *
      * @dataProvider provider_test_finds_next_url
      */
-    public function test_next_url_finds_the_url($url, $markup)
+    public function test_next_url_finds_the_url($url, $markup, $base_url='https://wordpress.org')
     {
-        $p = new WP_Block_Markup_Url_Processor($markup);
-        $this->assertTrue($p->next_url(), 'Failed to find the URL in the markup.');
+        $p = new WP_Block_Markup_Url_Processor($markup, $base_url);
+		$this->assertTrue( $p->next_url(), 'Failed to find the URL in the markup.' );
 		$this->assertEquals($url, $p->get_url(), 'Found a URL in the markup, but it wasn\'t the expected one.');
     }
 
@@ -54,13 +26,13 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
     {
         return [
             'In the <a> tag' => ['https://wordpress.org', '<a href="https://wordpress.org">'],
-            'In the first block attribute, when it contains just the URL' => [
-	            'https://mysite.com/wp-content/image.png',
-	            '<!-- wp:image {"src": "https://mysite.com/wp-content/image.png"} -->'
-            ],
             'In the second block attribute, when it contains just the URL' => [
 	            'https://mysite.com/wp-content/image.png',
 	            '<!-- wp:image {"class": "wp-bold", "src": "https://mysite.com/wp-content/image.png"} -->'
+            ],
+            'In the first block attribute, when it contains just the URL' => [
+	            'https://mysite.com/wp-content/image.png',
+	            '<!-- wp:image {"src": "https://mysite.com/wp-content/image.png"} -->'
             ],
             'In a block attribute, in a nested object, when it contains just the URL' => [
 	            'https://mysite.com/wp-content/image.png',
@@ -74,6 +46,10 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 	            'https://wordpress.org',
 	            'Have you seen https://wordpress.org? '
             ],
+            'In a text node after a tag' => [
+	            'wordpress.org',
+	            '<p>Have you seen wordpress.org'
+            ],
             'In a text node, when it contains a protocol-relative absolute URL' => [
 	            '//wordpress.org',
 	            'Have you seen //wordpress.org? '
@@ -85,6 +61,16 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
             'In a text node, when it contains a domain-only absolute URL with path' => [
 	            'wordpress.org/plugins',
 	            'Have you seen wordpress.org/plugins? '
+            ],
+            'Matches an empty string in <a href=""> as a valid relative URL when given a base URL' => [
+	            '',
+	            '<a href=""></a>',
+	            'https://wordpress.org'
+            ],
+            'Skips over an empty string in <a href=""> when not given a base URL' => [
+	            'https://developer.w.org',
+	            '<a href=""></a><a href="https://developer.w.org"></a>',
+	            null
             ],
         ];
     }
@@ -143,7 +129,7 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 			'In the "src" block attribute' => [
 				'<!-- wp:image {"src": "https://mysite.com/wp-content/image.png"} -->',
 				'https://w.org',
-				'<!-- wp:image {"src": "https://w.org"} -->'
+				'<!-- wp:image {"src":"https:\/\/w.org"} -->'
 			],
 			'In a text node' => [
 				'Have you seen https://wordpress.org yet?',
@@ -155,7 +141,8 @@ class WP_Block_Markup_Url_Processor_Tests extends TestCase
 
 	public function test_set_url_complex_test_case()
 	{
-		$p = new WP_Block_Markup_Url_Processor(<<<HTML
+		$p = new WP_Block_Markup_Url_Processor(
+			<<<HTML
 <!-- wp:image {"src": "https://mysite.com/wp-content/image.png", "meta": {"src": "https://mysite.com/wp-content/image.png"}} -->
 	<img src="https://mysite.com/wp-content/image.png">
 <!-- /wp:image -->
@@ -170,7 +157,8 @@ Have you seen my blog, adamadam.blog? I told a story there of how I got my Bache
 check it out: https://adamadam.blog/2021/09/16/how-i-got-bachelors-in-six-months/
 </p>
 <!-- /wp:paragraph -->
-HTML
+HTML,
+			'https://adamadam.blog'
 		);
 
 		// Replace every url with 'https://site-export.internal'
@@ -180,7 +168,7 @@ HTML
 
 		$this->assertEquals(
 			<<<HTML
-<!-- wp:image {"src": "https://site-export.internal", "meta": {"src": "https://site-export.internal"}} -->
+<!-- wp:image {"src":"https:\/\/site-export.internal","meta":{"src":"https:\/\/site-export.internal"}} -->
 	<img src="https://site-export.internal">
 <!-- /wp:image -->
 

@@ -36,3 +36,7 @@ function __($input) {
 function esc_attr($input) {
 	return htmlspecialchars($input);
 }
+
+function esc_html($input) {
+	return htmlspecialchars($input);
+}

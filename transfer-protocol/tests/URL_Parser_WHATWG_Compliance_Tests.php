@@ -8,7 +8,7 @@ function load_test_examples() {
     /**
      * Removes UTF-16 sequences from a JSON string since PHP doesn't know how to decode
      * them and returns null from json_decode.
-     * 
+     *
      * @TODO: Isolate the problematic inputs and figure out what to do with them.
      *        Re-encode all the examples as XML? Or PHP serialize() format?
      */
@@ -25,12 +25,12 @@ function load_test_examples() {
     return json_decode($json, true);
 }
 
-class UrlParserTests extends TestCase
+class URL_Parser_WHATWG_Compliance_Tests extends TestCase
 {
 
     /**
      * Test url_parser function.
-     * 
+     *
      * @dataProvider data_valid_urls
      * @return void
      */
@@ -74,9 +74,9 @@ class UrlParserTests extends TestCase
 
         // @TODO: Figure out why this test case fails. I had to remove it from urltestdata.json because
         //        the UTF-16 sequences made the json_code return null. The error was:
-        //        
+        //
         //        > Single unpaired UTF-16 surrogate in unicode escape
-        //        
+        //
         // $valid_urls[] = array(
         //     array(
         //         "input" => "http://example.com/".encodeUtf16Hex('d800')."𐟾".encodeUtf16Hex('dfff')."﷐﷏﷯ﷰ￾￿?".encodeUtf16Hex('d800')."𐟾".encodeUtf16Hex('dfff')."﷐﷏﷯ﷰ￾￿",
@@ -98,7 +98,7 @@ class UrlParserTests extends TestCase
 
     /**
      * Test url_parser function.
-     * 
+     *
      * @dataProvider data_invalid_urls
      * @return void
      */
