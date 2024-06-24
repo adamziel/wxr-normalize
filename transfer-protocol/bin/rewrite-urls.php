@@ -70,8 +70,9 @@ switch ( $command ) {
 			echo "The --new-site-url option is required for the migrate_urls command.\n";
 			exit( 1 );
 		}
-		$parsed_current_site_url = WP_URL::parse( $options['current-site-url'] );
-		$string_new_site_url     = $options['new-site-url'];
+		$parsed_current_site_url       = WP_URL::parse( $options['current-site-url'] );
+		$decoded_current_site_pathname = urldecode( $parsed_current_site_url->pathname );
+		$string_new_site_url           = $options['new-site-url'];
 		$parsed_new_site_url     = WP_URL::parse( $string_new_site_url );
 
 		echo "Replacing $base_url with $string_new_site_url in the input.\n";
@@ -82,10 +83,25 @@ switch ( $command ) {
 			$matched_url        = $p->get_raw_url();
 			$parsed_matched_url = $p->get_parsed_url();
 			if ( $parsed_matched_url->hostname === $parsed_current_site_url->hostname ) {
+				$decoded_matched_pathname = urldecode( $parsed_matched_url->pathname );
+				$pathname_matches = str_starts_with( $decoded_matched_pathname, $decoded_current_site_pathname );
+				if ( ! $pathname_matches ) {
+					continue;
+				}
+
+				// It's a match! Let's rewrite the URL
+
 				$parsed_matched_url->hostname = $parsed_new_site_url->hostname;
-				if ( str_starts_with( $parsed_matched_url->pathname, $parsed_current_site_url->pathname ) ) {
-					$parsed_matched_url->pathname = $parsed_new_site_url->pathname . substr( $parsed_matched_url->pathname,
-							strlen( $parsed_current_site_url->pathname ) );
+				// short-circuit for empty pathnames
+				if ( '/' !== $parsed_current_site_url->pathname ) {
+					$parsed_matched_url->pathname =
+						$parsed_new_site_url->pathname .
+						substr(
+							$decoded_matched_pathname,
+							// @TODO: Why is + 1 needed to avoid a double slash in the pathname?
+							strlen( urldecode( $parsed_current_site_url->pathname ) ) + 1
+						)
+					;
 				}
 
 				/*
