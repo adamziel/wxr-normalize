@@ -26,9 +26,13 @@
  * [3] AsyncHttpClient: https://github.com/WordPress/blueprints-library/blob/trunk/src/WordPress/AsyncHttp/Client.php
  */
 
+use \WordPress\AsyncHttp\Client;
+use \WordPress\AsyncHttp\Request;
+ 
 // Where to find the streaming WP_XML_Processor 
 // Use a version from this PR: https://github.com/adamziel/wordpress-develop/pull/43
 define('WP_XML_API_PATH', __DIR__ );
+define('BLUEPRINTS_LIB_PATH', __DIR__ . '/blueprints-library/src/WordPress' );
 if(!file_exists(WP_XML_API_PATH . '/class-wp-token-map.php')) {
     copy(WP_XML_API_PATH.'/../class-wp-token-map.php', WP_XML_API_PATH . '/class-wp-token-map.php');
 }
@@ -52,6 +56,16 @@ $requires[] = WP_XML_API_PATH . "/class-wp-html-processor.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-xml-decoder.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-xml-tag-processor.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-xml-processor.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/Streams/StreamWrapperInterface.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/Streams/StreamWrapper.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/Streams/StreamPeekerWrapper.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/Request.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/Response.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/HttpError.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/Connection.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/Client.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/StreamWrapper/ChunkedEncodingWrapper.php";
+$requires[] = BLUEPRINTS_LIB_PATH . "/AsyncHttp/StreamWrapper/InflateStreamWrapper.php";
 
 foreach ($requires as $require) {
     require_once $require;
@@ -184,7 +198,10 @@ foreach($assets_details as $url => $details) {
         $url_to_path[$url] = $details['download_path'];
     }
 }
-download_assets($url_to_path);
+wp_download_files([
+    'concurrency' => 10,
+    'assets' => $url_to_path
+]);
 
 // Rewrite the URLs in the WXR file
 $input_stream = fopen(WXR_PATH, 'rb+');
@@ -211,84 +228,47 @@ $normalizer->process();
 fclose($input_stream);
 fclose($output_stream);
 
-function download_assets($url_to_path) {
-    $mh = curl_multi_init();
-    $handles = [];
-    $window_size = 10;
-    $active_handles = 0;
-    
-    foreach ($url_to_path as $url => $local_path) {
-        // Initialize curl handle
-        $ch = curl_init($url);
-        $fp = fopen($local_path, 'w');
-    
-        curl_setopt($ch, CURLOPT_FILE, $fp);
-        curl_setopt($ch, CURLOPT_HEADER, 0);
-    
-        // Add handle to multi-handle
-        curl_multi_add_handle($mh, $ch);
-        $handles[(int) $ch] = ['handle' => $ch, 'fp' => $fp];
-        $active_handles++;
-    
-        // When window_size is reached, execute handles
-        if ($active_handles == $window_size) {
-            do {
-                $execrun = curl_multi_exec($mh, $running);
-            } while ($execrun == CURLM_CALL_MULTI_PERFORM);
-    
-            while ($running && $execrun == CURLM_OK) {
-                if (curl_multi_select($mh) == -1) {
-                    usleep(100);
-                }
-    
-                do {
-                    $execrun = curl_multi_exec($mh, $running);
-                } while ($execrun == CURLM_CALL_MULTI_PERFORM);
-            }
-    
-            while ($done = curl_multi_info_read($mh)) {
-                $handle = $done['handle'];
-                $fp = $handles[(int) $handle]['fp'];
-    
-                curl_multi_remove_handle($mh, $handle);
-                curl_close($handle);
-                fclose($fp);
-    
-                unset($handles[(int) $handle]);
-                $active_handles--;
-            }
-        }
-    }
-    
-    // Process any remaining handles
-    do {
-        $execrun = curl_multi_exec($mh, $running);
-    } while ($execrun == CURLM_CALL_MULTI_PERFORM);
-    
-    while ($running && $execrun == CURLM_OK) {
-        if (curl_multi_select($mh) == -1) {
-            usleep(100);
-        }
-    
-        do {
-            $execrun = curl_multi_exec($mh, $running);
-        } while ($execrun == CURLM_CALL_MULTI_PERFORM);
-    }
-    
-    while ($done = curl_multi_info_read($mh)) {
-        $handle = $done['handle'];
-        $fp = $handles[(int) $handle]['fp'];
-    
-        curl_multi_remove_handle($mh, $handle);
-        curl_close($handle);
-        fclose($fp);
-    
-        unset($handles[(int) $handle]);
-    }
-    
-    curl_multi_close($mh);
-}
+function wp_download_files($options) {
+	$requests = [];
+	$local_paths = [];
+	foreach ($options['assets'] as $asset_url => $local_file) {
+		$request = new Request($asset_url);
+		$requests[] = $request;
+		$local_paths[$request->id] = $local_file;
+	}
 
+	$client = new Client( [
+		'concurrency' => 10,
+	] );
+	$client->enqueue( $requests );
+
+	$results = [];
+	while ( $client->await_next_event() ) {
+		$request = $client->get_request();
+		
+		switch ( $client->get_event() ) {
+			case Client::EVENT_BODY_CHUNK_AVAILABLE:
+				file_put_contents(
+					$local_paths[$request->original_request()->id],
+					$client->get_response_body_chunk(),
+					FILE_APPEND
+				);
+				break;
+			case Client::EVENT_FAILED:
+				$results[$request->original_request()->url] = [
+					'success' => false,
+					'error' => $request->error,
+				];
+				break;
+			case Client::EVENT_FINISHED:
+				$results[$request->original_request()->url] = [
+					'success' => true
+				];
+				break;
+		}
+	}
+	return $results;
+}
 
 /**
  * WordPress compat
