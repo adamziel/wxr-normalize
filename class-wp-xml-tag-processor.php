@@ -337,7 +337,7 @@ class WP_XML_Tag_Processor {
 	 * @since WP_VERSION
 	 * @var string
 	 */
-	protected $xml;
+	public $xml;
 
 	/**
 	 * The last query passed to next_tag().
@@ -428,7 +428,7 @@ class WP_XML_Tag_Processor {
 	 * @since WP_VERSION
 	 * @var int
 	 */
-	private $bytes_already_parsed = 0;
+	public $bytes_already_parsed = 0;
 
 	/**
 	 * Byte offset in input document where current token starts.
@@ -1750,6 +1750,31 @@ class WP_XML_Tag_Processor {
 		$this->text_length             = 0;
 		$this->is_closing_tag          = null;
 		$this->attributes              = array();
+	}
+	
+	protected function reset_state()
+	{
+		$this->xml = '';
+		$this->last_query = null;
+		$this->sought_tag_name		   = null;
+		$this->sought_match_offset	   = 0;
+		$this->stop_on_tag_closers	   = false;
+		$this->parser_state            = self::STATE_READY;
+		$this->is_incomplete_text_node = false;
+		$this->bytes_already_parsed	   = 0;
+		$this->token_starts_at         = null;
+		$this->token_length            = null;
+		$this->tag_name_starts_at = null;
+		$this->tag_name_length = null;
+		$this->text_starts_at = null;
+		$this->text_length = null;
+		$this->is_closing_tag          = null;
+		$this->last_error			   = null;
+		$this->attributes              = array();
+		$this->bookmarks              = array();
+		$this->lexical_updates = array();
+		$this->seek_count			   = 0;
+		$this->had_previous_chunks			   = false;
 	}
 
 	/**

@@ -89,6 +89,28 @@ class WP_XML_Processor extends WP_XML_Tag_Processor {
 	}
 
 	/**
+	 * Wipes out the processed XML and appends the next chunk of XML to
+	 * any remaining unprocessed XML.
+	 * 
+	 * @param string $next_chunk XML to append.
+	 */
+	public function stream_append_xml( $next_chunk )
+	{
+		$this->get_updated_xml();
+
+		$new_xml = $this->get_unprocessed_xml() . $next_chunk;
+		$breadcrumbs = $this->get_breadcrumbs();
+		$parser_context = $this->get_parser_context();
+
+		$this->reset_state();
+
+		$this->xml = $new_xml;
+		$this->stack_of_open_elements = $breadcrumbs;
+		$this->parser_context         = $parser_context;
+		$this->had_previous_chunks    = true;
+	}
+
+	/**
 	 * Constructor.
 	 *
 	 * @since WP_VERSION
