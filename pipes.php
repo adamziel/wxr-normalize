@@ -56,8 +56,6 @@ trait BaseReadableStream {
 interface WritableStream {
 	public function write( string $data ): bool;
 
-	public function needs_more(): bool;
-
 	public function get_error(): ?string;
 }
 
@@ -83,10 +81,6 @@ trait BaseWritableStream {
 	}
 
 	abstract protected function doWrite( string $data ): bool;
-
-	public function needs_more(): bool {
-		return true;
-	}
 
 	protected function set_error( string $error ) {
 		$this->error    = $error ?: 'unknown error';
@@ -272,10 +266,6 @@ class EchoStream implements WritableStream {
 		return true;
 	}
 
-	public function needs_more(): bool {
-		return true;
-	}
-
 	public function is_finished(): bool {
 		return false; // EchoConsumer is never finished
 	}
@@ -392,10 +382,6 @@ class Pipe implements ReadableStream, WritableStream {
 
 	public function write( string $data ): bool {
 		return $this->stages[0]->write( $data );
-	}
-
-	public function needs_more(): bool {
-		return ! $this->finished;
 	}
 
 	public function consume_output(): ?string {
