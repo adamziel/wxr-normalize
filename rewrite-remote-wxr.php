@@ -50,34 +50,39 @@ use \WordPress\AsyncHttp\Request;
 // 	new EchoStream(),
 // ] );
 
+$wxr_rewriter = fn() => new XMLProcessorStream(function (WP_XML_Processor $processor) {
+	if (is_wxr_content_node($processor)) {
+		$text = $processor->get_modifiable_text();
+		$updated_text = Pipe::run([
+			new BlockMarkupURLRewriteStream(
+				$text,
+				[
+					'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
+					'to_url' => 'https://mynew.site/',
+				]
+			),
+		]);
+		if ($updated_text !== $text) {
+			$processor->set_modifiable_text($updated_text);
+		}
+	}
+});
 
 Pipe::run( [
 	new RequestStream( [
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/README.md' ),
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml' ),
+		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr' ),
 	] ),
-	new FilterStream( fn ($metadata) => ! str_ends_with( $metadata->get_filename(), '.md' ) ),
+	new FilterStream( fn ($metadata) => (
+		str_ends_with( $metadata->get_filename(), '.xml' ) ||
+		str_ends_with( $metadata->get_filename(), '.wxr' )
+	) ),
+	new DemultiplexerStream(fn () => $wxr_rewriter()),
+	new UppercaseTransformer(),
 	new DemultiplexerStream(fn () => Pipe::from([
-		new XMLProcessorStream(function (WP_XML_Processor $processor) {
-			if(is_wxr_content_node($processor)) {
-				$text         = $processor->get_modifiable_text();
-				$updated_text = Pipe::run([
-					new BlockMarkupURLRewriteStream( 
-						$text,
-						[
-							'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
-							'to_url'   => 'https://mynew.site/',
-						]
-					),
-				]);
-				if ( $updated_text !== $text ) {
-					$processor->set_modifiable_text( $updated_text );
-				}
-			}
-		}),
 		new EchoTransformer(),
-		new LocalFileStream(fn ($metadata) => __DIR__ . '/output/' . $metadata->get_resource_id() . '.chunk')
+		new LocalFileStream(fn ($metadata) => __DIR__ . '/output/' . $metadata->get_resource_id() . '.chunk'),
 	])),
 ] );
 

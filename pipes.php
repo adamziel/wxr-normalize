@@ -364,7 +364,7 @@ class FilterStream implements TransformStream {
 	}
 }
 
-class LocalFileStream implements WritableStream {
+class LocalFileStream implements WritableStream, ReadableStream {
 	private $error = null;
 	private $filename_factory;
 	private $fp;
@@ -388,6 +388,24 @@ class LocalFileStream implements WritableStream {
 
 	public function get_error(): ?string {
 		return $this->error;
+	}
+
+	// Temporary workaround to keep the Pipe class working
+	public function read(): bool {
+		return false;
+	}
+
+	public function is_finished(): bool {
+		return false;
+	}
+
+	public function consume_output(): ?string {
+		return null;
+	}
+
+	public function get_metadata(): ?StreamMetadata
+	{
+		return null;
 	}
 }
 
