@@ -5,18 +5,17 @@ use \WordPress\AsyncHttp\Request;
 
 interface ReadableStream {
 	public function read(): bool;
-
 	public function is_finished(): bool;
-
 	public function consume_output(): ?string;
-
 	public function get_error(): ?string;
+	public function get_metadata(): ?StreamMetadata;
 }
 
 trait BaseReadableStream {
 	protected $finished = false;
 	protected $error = null;
 	protected $buffer = '';
+	protected $metadata = null;
 
 	public function read(): bool {
 		if ( $this->finished || $this->error ) {
@@ -30,6 +29,11 @@ trait BaseReadableStream {
 
 	public function is_finished(): bool {
 		return $this->finished;
+	}
+
+	public function get_metadata(): ?StreamMetadata
+	{
+		return $this->metadata;
 	}
 
 	public function consume_output(): ?string {
@@ -46,6 +50,7 @@ trait BaseReadableStream {
 	protected function set_error( string $error ) {
 		$this->error    = $error ?: 'unknown error';
 		$this->finished = true;
+		$this->metadata = null;
 	}
 
 	public function get_error(): ?string {
@@ -54,7 +59,7 @@ trait BaseReadableStream {
 }
 
 interface WritableStream {
-	public function write( string $data ): bool;
+	public function write( string $data, ?StreamMetadata $metadata=null ): bool;
 
 	public function get_error(): ?string;
 }
@@ -71,18 +76,21 @@ trait BaseTransformStream {
 
 trait BaseWritableStream {
 	protected $error = null;
+	protected $metadata = null;
 
-	public function write( string $data ): bool {
+	public function write( string $data, ?StreamMetadata $metadata=null ): bool {
 		if ( $this->error ) {
 			return false;
 		}
 
-		return $this->doWrite( $data );
+		$this->metadata = $metadata;
+		return $this->doWrite( $data, $metadata );
 	}
 
-	abstract protected function doWrite( string $data ): bool;
+	abstract protected function doWrite( string $data, ?StreamMetadata $metadata ): bool;
 
 	protected function set_error( string $error ) {
+		$this->metadata = null;
 		$this->error    = $error ?: 'unknown error';
 		$this->finished = true;
 	}
@@ -96,7 +104,7 @@ class BufferStream implements TransformStream {
 
 	use BaseTransformStream;
 
-	protected function doWrite( string $data ): bool {
+	protected function doWrite( string $data, ?StreamMetadata $metadata=null ): bool {
 		$this->buffer .= $data;
 
 		return true;
@@ -151,7 +159,7 @@ class XMLProcessorStream implements TransformStream {
 		$this->node_visitor_callback = $node_visitor_callback;
 	}
 
-	protected function doWrite( string $data ): bool {
+	protected function doWrite( string $data, ?StreamMetadata $metadata=null ): bool {
 		$this->xml_processor->stream_append_xml( $data );
 
 		return true;
@@ -188,14 +196,82 @@ class XMLProcessorStream implements TransformStream {
 
 }
 
+class DemultiplexerStream implements TransformStream {
+	use BaseTransformStream;
+
+	private $pipe_factory;
+	private $pipes = [];
+	private $next_read = [];
+	public function __construct( $pipe_factory ) {
+		$this->pipe_factory = $pipe_factory;
+	}
+
+	protected function doWrite( string $data, ?StreamMetadata $metadata=null ): bool {
+		// -1 is the default stream ID used whenever we don't have any metadata
+		$stream_id = $metadata ? $metadata->get_resource_id() : -1;
+		if ( ! isset( $this->pipes[ $stream_id ] ) ) {
+			$pipe_factory = $this->pipe_factory;
+			$this->pipes[ $stream_id ] = $pipe_factory();
+		}
+
+		return $this->pipes[ $stream_id ]->write( $data, $metadata );
+	}
+
+	protected function doRead(): bool {
+		if(empty($this->next_read)) {
+			$this->next_read = array_keys($this->pipes);
+		}
+
+		while (count($this->next_read)) {
+			$stream_id = array_shift($this->next_read);
+			if (!isset($this->pipes[$stream_id])) {
+				continue;
+			}
+
+			$pipe = $this->pipes[$stream_id];
+			if(!($pipe instanceof ReadableStream)) {
+				// @TODO: What if the last pipe in the demultiplexer is not readable?
+				//        Then the entire multiplexer is not readable.
+				//        We need to conider this somehow in the Pipe class
+				//        around this line:
+				//            if ( $last_stage instanceof ReadableStream && $last_stage->read() ) {
+				return false;
+			}
+			if (!$pipe->read()) {
+				if ($pipe->is_finished()) {
+					unset($this->pipes[$stream_id]);
+				}
+				continue;
+			}
+
+			$this->buffer .= $pipe->consume_output();
+			$this->metadata = $pipe->get_metadata();
+			return true;
+		}
+
+		return false;
+	}
+
+}
+
 class RequestStream implements ReadableStream {
 	use BaseReadableStream;
 
 	private $client;
+	private $requests = [];
+	private $requests_metadata = [];
 
-	public function __construct( Request $request ) {
+	public function __construct( $requests ) {
 		$this->client = new Client();
-		$this->client->enqueue( [ $request ] );
+		$this->client->enqueue( $requests );
+
+		$this->requests = $requests;
+		foreach($requests as $request) {
+			$this->requests_metadata[$request->id] = new BasicStreamMetadata(
+				$request->id,
+				$request->url
+			);
+		}
 	}
 
 	protected function doRead(): bool {
@@ -205,16 +281,21 @@ class RequestStream implements ReadableStream {
 			return false;
 		}
 
+		$request = $this->client->get_request();
+		$this->metadata = $this->requests_metadata[$request->id];
 		switch ( $this->client->get_event() ) {
 			case Client::EVENT_BODY_CHUNK_AVAILABLE:
 				$this->buffer .= $this->client->get_response_body_chunk();
-
 				return true;
 			case Client::EVENT_FAILED:
-				$this->set_error( $this->client->get_request()->error ?: 'unknown error' );
+				// @TODO: Handling errors.
+				//        We don't want to stop everything if one request fails.
+				$this->set_error( $request->error ?: 'unknown error' );
 				break;
 			case Client::EVENT_FINISHED:
-				$this->finished = true;
+				if(count($this->client->get_active_requests()) === 0) {
+					$this->finished = true;
+				}
 				break;
 		}
 
@@ -230,8 +311,8 @@ abstract class StringTransformerStream implements TransformStream {
 		return ! empty( $this->buffer );
 	}
 
-	protected function doWrite( string $data ): bool {
-		$this->buffer .= strtoupper( $data );
+	protected function doWrite( string $data, ?StreamMetadata $metadata=null ): bool {
+		$this->buffer .= $this->transform( $data );
 
 		return true;
 	}
@@ -240,38 +321,69 @@ abstract class StringTransformerStream implements TransformStream {
 }
 
 class UppercaseTransformer extends StringTransformerStream {
-
 	protected function transform( string $data ): ?string {
 		return strtoupper( $data );
 	}
 }
 
 class Rot13Transformer extends StringTransformerStream {
-
 	protected function transform( string $data ): ?string {
 		return str_rot13( $data );
 	}
 }
 
-class EchoStream implements WritableStream {
-	private $error = null;
+class EchoTransformer extends StringTransformerStream {
+	protected function transform( string $data ): ?string {
+		echo $data;
+		return $data;
+	}
+}
 
-	public function read(): bool {
-		return false; // EchoConsumer does not produce data
+class FilterStream implements TransformStream {
+	use BaseTransformStream;
+
+	private $filter_callback;
+
+	public function __construct( $filter_callback ) {
+		$this->filter_callback = $filter_callback;
 	}
 
-	public function write( string $data ): bool {
-		echo $data;
+	protected function doRead(): bool {
+		return ! empty( $this->buffer );
+	}
 
+	protected function doWrite( string $data, ?StreamMetadata $metadata=null ): bool {
+		$filter_callback = $this->filter_callback;
+		if ( $filter_callback( $metadata ) ) {
+			$this->buffer .= $data;
+		} else {
+			$this->buffer = '';
+			$this->metadata = null;
+		}
 		return true;
 	}
+}
 
-	public function is_finished(): bool {
-		return false; // EchoConsumer is never finished
+class LocalFileStream implements WritableStream {
+	private $error = null;
+	private $filename_factory;
+	private $fp;
+
+	public function __construct($filename_factory)
+	{
+		$this->filename_factory = $filename_factory;
 	}
 
-	public function consume_output(): ?string {
-		return null; // EchoConsumer does not have data to produce
+	public function write( string $data, ?StreamMetadata $metadata=null ): bool {
+		if ( ! $this->fp ) {
+			$filename_factory = $this->filename_factory;
+			$filename = $filename_factory($metadata);
+			// @TODO: we'll need to close this. We could use a close() or cleanup() method here.
+			$this->fp = fopen($filename, 'wb');
+		}
+
+		fwrite($this->fp, $data);
+		return true;
 	}
 
 	public function get_error(): ?string {
@@ -279,6 +391,34 @@ class EchoStream implements WritableStream {
 	}
 }
 
+/**
+ * Extend this class when more metadata is needed.
+ */
+interface StreamMetadata {
+	public function get_resource_id();
+	public function get_filename();
+}
+
+class BasicStreamMetadata implements StreamMetadata {
+	private $resource_id;
+	private $filename;
+
+	public function __construct($resource_id, $filename=null)
+	{
+		$this->resource_id = $resource_id;
+		$this->filename = $filename;		
+	}
+
+	public function get_resource_id()
+	{
+		return $this->resource_id;
+	}
+
+	public function get_filename()
+	{
+		return $this->filename;
+	}
+}
 
 class Pipe implements ReadableStream, WritableStream {
 	private $stages = [];
@@ -355,7 +495,7 @@ class Pipe implements ReadableStream, WritableStream {
 
 			$anyDataPiped = true;
 			$nextStage    = $stages[ $i + 1 ];
-			if ( ! $nextStage->write( $data ) ) {
+			if ( ! $nextStage->write( $data, $stage->get_metadata() ) ) {
 				$this->error       = $nextStage->get_error();
 				$this->is_finished = true;
 				break;
@@ -380,8 +520,8 @@ class Pipe implements ReadableStream, WritableStream {
 		return false;
 	}
 
-	public function write( string $data ): bool {
-		return $this->stages[0]->write( $data );
+	public function write( string $data, ?StreamMetadata $metadata = null ): bool {
+		return $this->stages[0]->write( $data, $metadata );
 	}
 
 	public function consume_output(): ?string {
@@ -389,6 +529,11 @@ class Pipe implements ReadableStream, WritableStream {
 		$this->dataBuffer = '';
 
 		return $data;
+	}
+
+	public function get_metadata(): ?StreamMetadata
+	{
+		return $this->stages[ count( $this->stages ) - 1 ]->get_metadata();		
 	}
 
 	public function is_finished(): bool {

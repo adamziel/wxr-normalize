@@ -28,25 +28,57 @@ require __DIR__ . '/pipes.php';
 
 use \WordPress\AsyncHttp\Request;
 
+// Pipe::run( [
+// 	new RequestStream( [ new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/woo-products.wxr' ) ] ),
+// 	new XMLProcessorStream(function (WP_XML_Processor $processor) {
+// 		if(is_wxr_content_node($processor)) {
+// 			$text         = $processor->get_modifiable_text();
+// 			$updated_text = Pipe::run([
+// 				new BlockMarkupURLRewriteStream( 
+// 					$text,
+// 					[
+// 						'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
+// 						'to_url'   => 'https://mynew.site/',
+// 					]
+// 				),
+// 			]);
+// 			if ( $updated_text !== $text ) {
+// 				$processor->set_modifiable_text( $updated_text );
+// 			}
+// 		}
+// 	}),
+// 	new EchoStream(),
+// ] );
+
+
 Pipe::run( [
-	new RequestStream( new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/woo-products.wxr' ) ),
-	new XMLProcessorStream(function (WP_XML_Processor $processor) {
-		if(is_wxr_content_node($processor)) {
-			$text         = $processor->get_modifiable_text();
-			$updated_text = Pipe::run([
-				new BlockMarkupURLRewriteStream( 
-					$text,
-					[
-						'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
-						'to_url'   => 'https://mynew.site/',
-					]
-				),
-			]);
-			if ( $updated_text !== $text ) {
-				$processor->set_modifiable_text( $updated_text );
+	new RequestStream( [
+		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/README.md' ),
+		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
+		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml' ),
+	] ),
+	new FilterStream( fn ($metadata) => ! str_ends_with( $metadata->get_filename(), '.md' ) ),
+	new DemultiplexerStream(fn () => Pipe::from([
+		new XMLProcessorStream(function (WP_XML_Processor $processor) {
+			if(is_wxr_content_node($processor)) {
+				$text         = $processor->get_modifiable_text();
+				$updated_text = Pipe::run([
+					new BlockMarkupURLRewriteStream( 
+						$text,
+						[
+							'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
+							'to_url'   => 'https://mynew.site/',
+						]
+					),
+				]);
+				if ( $updated_text !== $text ) {
+					$processor->set_modifiable_text( $updated_text );
+				}
 			}
-		}
-	}),
-	new EchoStream(),
+		}),
+		new EchoTransformer(),
+		new LocalFileStream(fn ($metadata) => __DIR__ . '/output/' . $metadata->get_resource_id() . '.chunk')
+	])),
 ] );
+
 
