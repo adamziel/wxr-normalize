@@ -1,7 +1,5 @@
 <?php
 
-require __DIR__ . '/bootstrap.php';
-
 use \WordPress\AsyncHttp\Client;
 use \WordPress\AsyncHttp\Request;
 
@@ -10,7 +8,7 @@ interface ReadableStream {
 
 	public function is_finished(): bool;
 
-	public function get_output(): ?string;
+	public function consume_output(): ?string;
 
 	public function get_error(): ?string;
 }
@@ -34,7 +32,7 @@ trait BaseReadableStream {
 		return $this->finished;
 	}
 
-	public function get_output(): ?string {
+	public function consume_output(): ?string {
 		if ( $this->buffer !== '' ) {
 			$data         = $this->buffer;
 			$this->buffer = '';
@@ -66,6 +64,13 @@ interface WritableStream {
 interface TransformStream extends ReadableStream, WritableStream {
 }
 
+trait BaseTransformStream {
+	use BaseReadableStream, BaseWritableStream {
+		BaseReadableStream::get_error insteadof BaseWritableStream;
+		BaseReadableStream::set_error insteadof BaseWritableStream;
+	}
+}
+
 trait BaseWritableStream {
 	protected $error = null;
 
@@ -93,11 +98,9 @@ trait BaseWritableStream {
 	}
 }
 
-class BufferStream implements WritableStream {
+class BufferStream implements TransformStream {
 
-	use BaseWritableStream;
-
-	private $buffer = '';
+	use BaseTransformStream;
 
 	protected function doWrite( string $data ): bool {
 		$this->buffer .= $data;
@@ -105,18 +108,12 @@ class BufferStream implements WritableStream {
 		return true;
 	}
 
-	public function get_output(): ?string {
-		return $this->buffer;
+	protected function doRead(): bool {
+		return strlen( $this->buffer ) > 0;
 	}
 
 }
 
-trait BaseTransformStream {
-	use BaseReadableStream, BaseWritableStream {
-		BaseReadableStream::get_error insteadof BaseWritableStream;
-		BaseReadableStream::set_error insteadof BaseWritableStream;
-	}
-}
 
 class BlockMarkupURLVisitorStream implements ReadableStream {
 
@@ -232,89 +229,33 @@ class RequestStream implements ReadableStream {
 
 }
 
-class UppercaseTransformer implements ReadableStream, WritableStream {
-	private $data = '';
-	private $finished = false;
-	private $error = null;
+abstract class StringTransformerStream implements TransformStream {
+	use BaseTransformStream;
 
-	public function read(): bool {
-		return ! empty( $this->data );
+	protected function doRead(): bool {
+		return ! empty( $this->buffer );
 	}
 
-	public function write( string $data ): bool {
-		$this->data .= strtoupper( $data );
+	protected function doWrite( string $data ): bool {
+		$this->buffer .= strtoupper( $data );
 
 		return true;
 	}
 
-	public function needs_more(): bool {
-		return ! $this->finished;
-	}
+	abstract protected function transform(string $data): ?string;
+}
 
-	public function is_finished(): bool {
-		return $this->finished;
-	}
+class UppercaseTransformer extends StringTransformerStream {
 
-	public function get_output(): ?string {
-		if ( $this->data !== '' ) {
-			$data       = $this->data;
-			$this->data = '';
-
-			return $data;
-		}
-
-		return null;
-	}
-
-	public function get_error(): ?string {
-		return $this->error;
-	}
-
-	public function set_finished() {
-		$this->finished = true;
+	protected function transform( string $data ): ?string {
+		return strtoupper( $data );
 	}
 }
 
-class Rot13Transformer implements ReadableStream, WritableStream {
-	private $data = '';
-	private $finished = false;
-	private $error = null;
+class Rot13Transformer extends StringTransformerStream {
 
-	public function read(): bool {
-		return ! empty( $this->data );
-	}
-
-	public function write( string $data ): bool {
-		$this->data .= str_rot13( $data );
-
-		return true;
-	}
-
-	public function needs_more(): bool {
-		return ! $this->finished;
-	}
-
-	public function is_finished(): bool {
-		return $this->finished;
-	}
-
-	public function get_output(): ?string {
-		if ( $this->data !== '' ) {
-			$data       = $this->data;
-			$this->data = '';
-
-			return $data;
-		}
-
-		return null;
-	}
-
-	public function get_error(): ?string {
-		return $this->error;
-	}
-
-	public function set_finished() {
-		$this->finished = true;
+	protected function transform( string $data ): ?string {
+		return str_rot13( $data );
 	}
 }
 
@@ -339,7 +280,7 @@ class EchoStream implements WritableStream {
 		return false; // EchoConsumer is never finished
 	}
 
-	public function get_output(): ?string {
+	public function consume_output(): ?string {
 		return null; // EchoConsumer does not have data to produce
 	}
 
@@ -354,6 +295,20 @@ class Pipe implements ReadableStream, WritableStream {
 	private $error = null;
 	private $finished = false;
 	private $dataBuffer = '';
+
+	static public function run($stages)
+	{
+		$pipe = Pipe::from( $stages );
+
+		while (!$pipe->is_finished()) {
+			if ( ! $pipe->read() ) {
+				// If no new data was produced, wait a bit before trying again
+				usleep( 10000 ); // Sleep for 10ms
+			}
+		}
+
+		return $pipe->consume_output();
+	}
 
 	static public function from( $stages ) {
 		if ( count( $stages ) === 0 ) {
@@ -386,7 +341,7 @@ class Pipe implements ReadableStream, WritableStream {
 		for ( $i = 0; $i < count( $stages ) - 1; $i ++ ) {
 			$stage = $stages[ $i ];
 
-			$data = $stage->get_output();
+			$data = $stage->consume_output();
 			if ( null === $data ) {
 				if ( ! $stage->read() ) {
 					if ( $stage->get_error() ) {
@@ -401,7 +356,7 @@ class Pipe implements ReadableStream, WritableStream {
 					}
 					break;
 				}
-				$data = $stage->get_output();
+				$data = $stage->consume_output();
 			}
 
 			if ( null === $data ) {
@@ -419,7 +374,7 @@ class Pipe implements ReadableStream, WritableStream {
 
 		$last_stage = $stages[ count( $stages ) - 1 ];
 		if ( $last_stage instanceof ReadableStream && $last_stage->read() ) {
-			$this->dataBuffer .= $last_stage->get_output();
+			$this->dataBuffer .= $last_stage->consume_output();
 			if ( $last_stage->is_finished() ) {
 				$this->finished = true;
 			}
@@ -436,18 +391,14 @@ class Pipe implements ReadableStream, WritableStream {
 	}
 
 	public function write( string $data ): bool {
-		if ( isset( $this->stages[0] ) && $this->stages[0] instanceof WritableStream ) {
-			return $this->stages[0]->write( $data );
-		}
-
-		return false;
+		return $this->stages[0]->write( $data );
 	}
 
 	public function needs_more(): bool {
 		return ! $this->finished;
 	}
 
-	public function get_output(): ?string {
+	public function consume_output(): ?string {
 		$data             = $this->dataBuffer;
 		$this->dataBuffer = '';
 
@@ -463,77 +414,84 @@ class Pipe implements ReadableStream, WritableStream {
 	}
 }
 
-function rewrite_url(
-    string $raw_matched_url,
-    $parsed_matched_url,
-    $parsed_current_site_url,
-    $parsed_new_site_url,
-) {
-    // Let's rewrite the URL
-    $parsed_matched_url->hostname = $parsed_new_site_url->hostname;
-    $decoded_matched_pathname = urldecode( $parsed_matched_url->pathname );
+class BlockMarkupURLRewriteStream extends BlockMarkupURLVisitorStream
+{
+	private $from_url;
+	private $parsed_from_url;
+	private $parsed_from_url_pathname;
 
-    // Short-circuit for empty pathnames
-    if ('/' !== $parsed_current_site_url->pathname) {
-        $parsed_matched_url->pathname =
-            $parsed_new_site_url->pathname .
-            substr(
-                $decoded_matched_pathname,
-                strlen(urldecode($parsed_current_site_url->pathname))
-            );
-    }
+	private $to_url;
+	private $parsed_to_url;
 
-    /*
-     * Stylistic choice – if the matched URL has no trailing slash,
-     * do not add it to the new URL. The WHATWG URL parser will
-     * add one automatically if the path is empty, so we have to
-     * explicitly remove it.
-     */
-    $new_raw_url = $parsed_matched_url->toString();
-    if (
-        $raw_matched_url[strlen($raw_matched_url) - 1] !== '/' &&
-        $parsed_matched_url->pathname === '/' &&
-        $parsed_matched_url->search === '' &&
-        $parsed_matched_url->hash === ''
-    ) {
-        $new_raw_url = rtrim($new_raw_url, '/');
-    }
+	private $base_url = 'https://playground.internal';
 
-    return $new_raw_url;
-}
+	public function __construct($text, $options)
+	{
+		$this->from_url = $options['from_url'];
+		$this->parsed_from_url = WP_URL::parse($this->from_url);
+		$this->parsed_from_url_pathname = urldecode($this->parsed_from_url->pathname);
+		$this->to_url = $options['to_url'];
+		$this->parsed_to_url = WP_URL::parse($this->to_url);
 
-function create_url_rewrite_stream( 
-	$text,
-	$options
-) {
-	$string_new_site_url = $options['to_url'];
-	$parsed_new_site_url = WP_URL::parse( $string_new_site_url );
+		parent::__construct(
+			new WP_Block_Markup_Url_Processor($text, $this->from_url),
+			[$this, 'url_node_visitor']
+		);
+	}
 
-	$current_site_url        = $options['from_url'];
-	$parsed_current_site_url = WP_URL::parse( $current_site_url );
-	$decoded_current_site_pathname = urldecode( $parsed_current_site_url->pathname );
-
-	$base_url      = 'https://playground.internal';
-	return new BlockMarkupURLVisitorStream(
-		new WP_Block_Markup_Url_Processor( $text, $base_url ),
-		function(WP_Block_Markup_Url_Processor $p) use($parsed_current_site_url, $decoded_current_site_pathname, $parsed_new_site_url) {
-			$parsed_matched_url = $p->get_parsed_url();
-			if ( $parsed_matched_url->hostname === $parsed_current_site_url->hostname ) {
-				$decoded_matched_pathname = urldecode( $parsed_matched_url->pathname );
-				$pathname_matches         = str_starts_with( $decoded_matched_pathname, $decoded_current_site_pathname );
-				if ( ! $pathname_matches ) {
-					return;
-				}
-				// It's a match!
-				$p->set_raw_url( rewrite_url(
+	protected function url_node_visitor(WP_Block_Markup_Url_Processor $p)
+	{
+		$parsed_matched_url = $p->get_parsed_url();
+		if ($parsed_matched_url->hostname === $this->parsed_from_url->hostname) {
+			$decoded_matched_pathname = urldecode($parsed_matched_url->pathname);
+			$pathname_matches = str_starts_with($decoded_matched_pathname, $this->parsed_from_url_pathname);
+			if (!$pathname_matches) {
+				return;
+			}
+			// It's a match!
+			$p->set_raw_url(
+				$this->rewrite_url(
 					$p->get_raw_url(),
 					$parsed_matched_url,
-					$parsed_current_site_url,
-					$parsed_new_site_url
-				) );
-			}
+				)
+			);
 		}
-    );
+	}
+
+	public function rewrite_url( string $raw_matched_url, $parsed_matched_url ) {
+		// Let's rewrite the URL
+		$parsed_matched_url->hostname = $this->parsed_to_url->hostname;
+		$decoded_matched_pathname = urldecode($parsed_matched_url->pathname);
+
+		// Short-circuit for empty pathnames
+		if ('/' !== $this->parsed_from_url->pathname) {
+			$parsed_matched_url->pathname =
+				$this->parsed_to_url->pathname .
+				substr(
+					$decoded_matched_pathname,
+					strlen(urldecode($this->parsed_from_url->pathname))
+				);
+		}
+
+		/*
+		 * Stylistic choice – if the matched URL has no trailing slash,
+		 * do not add it to the new URL. The WHATWG URL parser will
+		 * add one automatically if the path is empty, so we have to
+		 * explicitly remove it.
+		 */
+		$new_raw_url = $parsed_matched_url->toString();
+		if (
+			$raw_matched_url[strlen($raw_matched_url) - 1] !== '/' &&
+			$parsed_matched_url->pathname === '/' &&
+			$parsed_matched_url->search === '' &&
+			$parsed_matched_url->hash === ''
+		) {
+			$new_raw_url = rtrim($new_raw_url, '/');
+		}
+
+		return $new_raw_url;
+	}
+
 }
 
 function is_wxr_content_node( WP_XML_Processor $processor ) {
@@ -564,45 +522,3 @@ function is_wxr_content_node( WP_XML_Processor $processor ) {
 
 	return false;
 };
-
-// Create the pipe and chain the stages
-$pipe = Pipe::from( [
-	new RequestStream( new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/woo-products.wxr' ) ),
-	new XMLProcessorStream(function (WP_XML_Processor $processor) {
-		if(is_wxr_content_node($processor)) {
-			$text         = $processor->get_modifiable_text();
-			$pipe = Pipe::from([
-				create_url_rewrite_stream( 
-					$text,
-					[
-						'from_url' => 'https://raw.githubusercontent.com/wordpress/blueprints/normalize-wxr-assets/blueprints/stylish-press-clone/wxr-assets/',
-						'to_url'   => 'https://mynew.site/',
-					]
-				)
-			]);
-			while (!$pipe->is_finished()) {
-				$pipe->read();
-			}
-
-			$updated_text = $pipe->get_output();
-			if ( $updated_text !== $text ) {
-				$processor->set_modifiable_text( $updated_text );
-			}
-		}
-	}),
-	new EchoStream(),
-] );
-
-$i = 0;
-// Process data incrementally as it becomes available
-while ( ! $pipe->is_finished() ) {
-	if ( ++ $i > 22 ) {
-		// break;
-	}
-	if ( ! $pipe->read() ) {
-		// If no new data was produced, wait a bit before trying again
-		usleep( 100000 ); // Sleep for 100ms
-	}
-}
-
-var_dump( $pipe );
