@@ -3,7 +3,7 @@
 use \WordPress\AsyncHttp\Client;
 use \WordPress\AsyncHttp\Request;
 
-interface ReadableStream {
+interface ReadableStream extends Iterator {
 	public function read(): bool;
 	public function is_finished(): bool;
 	public function consume_output(): ?string;
@@ -11,7 +11,51 @@ interface ReadableStream {
 	public function get_metadata(): ?StreamMetadata;
 }
 
+trait ReadableStreamIterator
+{
+	private $position = 0;
+	private $iterator_output_cache = null;
+
+	public function current(): mixed {
+		if(null === $this->iterator_output_cache) {
+			$this->iterator_output_cache = $this->consume_output();
+		}
+		return (object) [
+			'bytes' => $this->iterator_output_cache,
+			'metadata' => $this->get_metadata(),
+		];
+	}
+
+	public function key(): mixed {
+		return $this->position;
+	}
+
+	public function next(): void {
+		$this->iterator_output_cache = null;
+		while(false === $this->read()) {
+			if ($this->is_finished()) {
+				return;
+			}
+			if($this->get_error()) {
+				return;
+			}
+			usleep(10000);
+		}
+	}
+
+	public function rewind(): void {
+		$this->position = 0;
+		$this->next();
+	}
+
+	public function valid(): bool {
+		return !$this->is_finished();
+	}
+}
+
 trait BaseReadableStream {
+	use ReadableStreamIterator;
+
 	protected $finished = false;
 	protected $error = null;
 	protected $buffer = '';
@@ -388,6 +432,8 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 	private $buffer;
 	private $fp;
 
+	use ReadableStreamIterator;
+
 	static public function stream( $filename_factory ) {
 		return new Demultiplexer(
 			fn() => new self( $filename_factory )
@@ -476,6 +522,8 @@ class BasicStreamMetadata implements StreamMetadata {
 
 class Demultiplexer implements ReadableStream, WritableStream
 {
+
+	use ReadableStreamIterator;
 
 	public $factory_function;
 	private $stream_instances = [];
@@ -583,6 +631,8 @@ class Pipe implements ReadableStream, WritableStream {
 	private $error = null;
 	private $finished = false;
 	private $dataBuffer = '';
+
+	use ReadableStreamIterator;
 
 	static public function run($stages)
 	{
