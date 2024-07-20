@@ -68,6 +68,22 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 	}
 };
 
+
+// $client = new WordPress\AsyncHttp\Client();
+// $client->enqueue( [
+// 	new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
+// 	new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
+// 	new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml' ),
+// 	new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml?a' ),
+// 	new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr' ),
+// ] );
+
+// while ( $client->await_next_event() ) {
+// 	var_dump($client->get_event());
+// }
+
+// die();
+
 Pipe::run( [
 	HttpClient::stream( [
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
@@ -76,9 +92,11 @@ Pipe::run( [
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml?a' ),
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr' ),
 	] ),
-	XML_Processor::stream($rewrite_links_in_wxr_node),
-	LocalFileWriter::stream(fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk'),
+	XML_Processor::stream( $rewrite_links_in_wxr_node ),
+	LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk' ),
 ] );
+
+
 
 
 // while ( $pipe->next() ) {

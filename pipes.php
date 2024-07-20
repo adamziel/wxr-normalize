@@ -149,9 +149,7 @@ class BlockMarkupURLVisitorStream implements ReadableStream {
 }
 
 class XML_Processor {
-
-	static public function stream($node_visitor_callback)
-	{
+	static public function stream($node_visitor_callback) {
 		return new Demultiplexer(
 			fn() => new XMLProcessorStream($node_visitor_callback)
 		);
@@ -230,6 +228,10 @@ class DemultiplexerStream implements TransformStream {
 	protected function doRead(): bool {
 		if(empty($this->next_read)) {
 			$this->next_read = array_keys($this->pipes);
+			if(empty($this->pipes)) {
+				$this->finished = true;
+				return false;
+			}
 		}
 
 		while (count($this->next_read)) {
@@ -265,12 +267,9 @@ class DemultiplexerStream implements TransformStream {
 }
 
 class HttpClient {
-
-	static public function stream($requests)
-	{
+	static public function stream($requests) {
 		return new RequestStream($requests);
 	}
-	
 }
 
 class RequestStream implements ReadableStream {
@@ -312,9 +311,8 @@ class RequestStream implements ReadableStream {
 				$this->set_error( $request->error ?: 'unknown error' );
 				break;
 			case Client::EVENT_FINISHED:
-				if(count($this->client->get_active_requests()) === 0) {
-					$this->finished = true;
-				}
+				// @TODO: Mark this particular resource as finished without
+				//        closing the entire Client stream.
 				break;
 		}
 
@@ -523,9 +521,18 @@ class Demultiplexer implements ReadableStream, WritableStream
 		do {
 			if (empty($this->read_queue)) {
 				$this->read_queue = $this->stream_instances;
+				if (empty($this->read_queue)) {
+					return false;
+				}
 			}
 
 			$stream = array_shift($this->read_queue);
+			if ( $stream->is_finished() ) {
+				$index = array_search($stream, $this->stream_instances, true);
+				unset($this->stream_instances[$index]);
+				continue;
+			}
+
 			if ($stream->read()) {
 				$this->last_read_stream = $stream;
 				return true;
@@ -539,11 +546,6 @@ class Demultiplexer implements ReadableStream, WritableStream
 			}
 
 			++$processed_streams;
-
-			if ( $stream->is_finished() ) {
-				// @TODO: Handle this case, track which streams are finished
-				//        and take them off the instances list and the read queue.
-			}
 		} while ($processed_streams < $available_streams);
 		return false;
 	}
@@ -558,14 +560,7 @@ class Demultiplexer implements ReadableStream, WritableStream
 	}
 
 	public function is_finished(): bool {
-		$finished = true;
-		foreach($this->stream_instances as $stream) {
-			if(!$stream->is_finished()) {
-				$finished = false;
-				break;
-			}
-		}
-		return $finished;
+		return count($this->stream_instances) === 0;
 	}
 
 	protected $error = null;
@@ -593,7 +588,7 @@ class Pipe implements ReadableStream, WritableStream {
 	{
 		$pipe = Pipe::from( $stages );
 
-		while (!$pipe->is_finished()) {
+		while ( ! $pipe->is_finished() ) {
 			if ( ! $pipe->read() ) {
 				// If no new data was produced, wait a bit before trying again
 				usleep( 10000 ); // Sleep for 10ms
@@ -628,6 +623,9 @@ class Pipe implements ReadableStream, WritableStream {
 	}
 
 	public function read(): bool {
+		if($this->finished) {
+			return false;
+		}
 		$anyDataPiped = false;
 
 		$stages = $this->stages;
@@ -647,7 +645,10 @@ class Pipe implements ReadableStream, WritableStream {
 					if ( $stage->is_finished() ) {
 						continue;
 					}
-					break;
+
+					// No data was produced by the stage, let's try again on the next read() call,
+					// and meanwhile let's see if the rest of the pipe will produce any data.
+					continue;
 				}
 				$data = $stage->consume_output();
 			}
