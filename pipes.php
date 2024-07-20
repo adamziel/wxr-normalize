@@ -430,6 +430,7 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 	private $filename_factory;
 	private $last_written_chunk;
 	private $buffer;
+	private $metadata;
 	private $fp;
 
 	use ReadableStreamIterator;
@@ -449,6 +450,7 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 		if ( ! $this->fp ) {
 			$filename_factory = $this->filename_factory;
 			$filename = $filename_factory($metadata);
+			$this->metadata = new BasicStreamMetadata($filename, $filename);
 			// @TODO: we'll need to close this. We could use a close() or cleanup() method here.
 			$this->fp = fopen($filename, 'wb');
 		}
@@ -487,7 +489,7 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 
 	public function get_metadata(): ?StreamMetadata
 	{
-		return null;
+		return $this->metadata;
 	}
 }
 
@@ -627,15 +629,36 @@ class Demultiplexer implements ReadableStream, WritableStream
 
 
 class Pipe implements ReadableStream, WritableStream {
+	private $stages_keys = [];
 	private $stages = [];
 	private $error = null;
+	private $context = null;
 	private $finished = false;
 	private $dataBuffer = '';
 
 	use ReadableStreamIterator;
 
-	static public function run($stages)
+	static public function get_output($stages)
 	{
+		return self::run($stages, ['buffer_output' => true]);
+	}
+
+	public function current(): mixed {
+		if(null === $this->iterator_output_cache) {
+			$this->iterator_output_cache = $this->consume_output();
+		}
+		return $this->context;
+		// (object) [
+		// 	'bytes' => $this->iterator_output_cache,
+		// 	'metadata' => $this->get_metadata(),
+		// ];
+	}
+
+	static public function run($stages, $options=array())
+	{
+		$options = array_merge([
+			'buffer_output' => false,
+		], $options);
 		$pipe = Pipe::from( $stages );
 
 		while ( ! $pipe->is_finished() ) {
@@ -643,8 +666,11 @@ class Pipe implements ReadableStream, WritableStream {
 				// If no new data was produced, wait a bit before trying again
 				usleep( 10000 ); // Sleep for 10ms
 			}
-		}
 
+			if(!$options['buffer_output']) {
+				$pipe->consume_output();
+			}
+		}
 		return $pipe->consume_output();
 	}
 
@@ -653,15 +679,16 @@ class Pipe implements ReadableStream, WritableStream {
 			throw new \InvalidArgumentException( 'Pipe must have at least one stage' );
 		}
 
-		for ( $i = 0; $i < count( $stages ) - 1; $i ++ ) {
-			if ( ! $stages[ $i ] instanceof ReadableStream ) {
-				throw new \InvalidArgumentException( 'All stages except the last one must be ReadableStreams, but ' . get_class( $stages[ $i ] ) . ' is not' );
+		$stages_values = array_values($stages);
+		for ( $i = 0; $i < count( $stages_values ) - 1; $i ++ ) {
+			if ( ! $stages_values[ $i ] instanceof ReadableStream ) {
+				throw new \InvalidArgumentException( 'All stages except the last one must be ReadableStreams, but ' . get_class( $stages_values[ $i ] ) . ' is not' );
 			}
 		}
 
-		for ( $i = 1; $i < count( $stages ); $i ++ ) {
-			if ( ! $stages[ $i ] instanceof WritableStream ) {
-				throw new \InvalidArgumentException( 'All stages except the first one must be WritableStream, but ' . get_class( $stages[ $i ] ) . ' is not' );
+		for ( $i = 1; $i < count( $stages_values ); $i ++ ) {
+			if ( ! $stages_values[ $i ] instanceof WritableStream ) {
+				throw new \InvalidArgumentException( 'All stages except the first one must be WritableStream, but ' . get_class( $stages_values[ $i ] ) . ' is not' );
 			}
 		}
 
@@ -669,7 +696,8 @@ class Pipe implements ReadableStream, WritableStream {
 	}
 
 	private function __construct( $stages ) {
-		$this->stages = $stages;
+		$this->stages_keys = array_keys($stages);
+		$this->stages = array_values($stages);
 	}
 
 	public function read(): bool {
@@ -679,6 +707,7 @@ class Pipe implements ReadableStream, WritableStream {
 		$anyDataPiped = false;
 
 		$stages = $this->stages;
+		$this->context = new PipeContext();
 		for ( $i = 0; $i < count( $stages ) - 1; $i ++ ) {
 			$stage = $stages[ $i ];
 
@@ -707,6 +736,8 @@ class Pipe implements ReadableStream, WritableStream {
 				break;
 			}
 
+			$this->context[$this->stages_keys[$i]] = $stage->get_metadata();
+
 			$anyDataPiped = true;
 			$nextStage    = $stages[ $i + 1 ];
 			if ( ! $nextStage->write( $data, $stage->get_metadata() ) ) {
@@ -716,9 +747,11 @@ class Pipe implements ReadableStream, WritableStream {
 			}
 		}
 
-		$last_stage = $stages[ count( $stages ) - 1 ];
+		$last_stage_idx = count( $stages ) - 1;
+		$last_stage = $stages[ $last_stage_idx ];
 		if ( $last_stage instanceof ReadableStream && $last_stage->read() ) {
 			$this->dataBuffer .= $last_stage->consume_output();
+			$this->context[$this->stages_keys[$last_stage_idx]] = $last_stage->get_metadata();
 			if ( $last_stage->is_finished() ) {
 				$this->finished = true;
 			}
@@ -732,6 +765,11 @@ class Pipe implements ReadableStream, WritableStream {
 		}
 
 		return false;
+	}
+
+	public function get_context()
+	{
+		return $this->context;		
 	}
 
 	public function write( string $data, ?StreamMetadata $metadata = null ): bool {
@@ -757,6 +795,33 @@ class Pipe implements ReadableStream, WritableStream {
 	public function get_error(): ?string {
 		return $this->error;
 	}
+}
+
+class PipeContext implements ArrayAccess {
+	private $context = [];
+
+	public function offsetExists($offset): bool {
+		return isset($this->context[$offset]);
+	}
+
+	public function offsetGet($offset): mixed {
+		return $this->context[$offset] ?? null;
+	}
+
+	public function offsetSet($offset, $value): void {
+		$this->context[$offset] = $value;
+	}
+
+	public function offsetUnset($offset): void {
+		unset($this->context[$offset]);
+	}
+
+	public function skip()
+	{
+		
+	}
+
+
 }
 
 class BlockMarkupURLRewriteStream extends BlockMarkupURLVisitorStream
@@ -867,3 +932,29 @@ function is_wxr_content_node( WP_XML_Processor $processor ) {
 
 	return false;
 };
+
+
+function composeIterators(array $iterators): Generator {
+    if (empty($iterators)) {
+        throw new InvalidArgumentException("Iterator list cannot be empty");
+    }
+
+    // Internal recursive function to handle the composition
+    function generatorCompose(array $iterators, int $index): Generator {
+        if ($index >= count($iterators)) {
+            return;
+        }
+
+        foreach ($iterators[$index] as $value) {
+            if ($index == count($iterators) - 1) {
+                yield $value;
+            } else {
+                foreach (generatorCompose($iterators, $index + 1) as $innerValue) {
+                    yield $innerValue;
+                }
+            }
+        }
+    }
+
+    return generatorCompose($iterators, 0);
+}

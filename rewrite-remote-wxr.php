@@ -53,7 +53,7 @@ use \WordPress\AsyncHttp\Request;
 $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 	if (is_wxr_content_node($processor)) {
 		$text = $processor->get_modifiable_text();
-		$updated_text = Pipe::run([
+		$updated_text = Pipe::get_output([
 			new BlockMarkupURLRewriteStream(
 				$text,
 				[
@@ -68,8 +68,10 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 	}
 };
 
+// @TODO: Implement the commented out parts
+
 $pipe = Pipe::from( [
-	HttpClient::stream( [
+	'http' => HttpClient::stream( [
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml' ),
@@ -77,48 +79,31 @@ $pipe = Pipe::from( [
 		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr' ),
 	] ),
 	XML_Processor::stream( $rewrite_links_in_wxr_node ),
-	// LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk' ),
+	// function ($context) {
+		// if ( ! str_ends_with( $zip->filename, '.wxr' ) ) {
+		// 	$zip->skip_file();
+		// }
+	// },
+	'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk' ),
 ] );
 
+// var_dump($pipe);
+
 foreach($pipe as $context) {
-	var_dump($context);
+	list( 'http' => $http, 'file' => $file ) = $context;
+	// print_r($http);
+	print_r($file);
+
+	// if ( $context->is_failure() ) {
+	// 	echo 'Failed to download ' . $http->url . ': ' . $context->get_error_message();
+	// 	continue;
+	// }
+
+	// // if ( ! str_ends_with( $zip->filename, '.wxr' ) ) {
+	// // 	$zip->skip_file();
+	// // 	continue;
+	// // }
+
+	// echo 'Saved ' . $http->url . ' to ' . $file->file_path;
 }
-
-
-
-// while ( $pipe->next() ) {
-// 	list( 'http' => $http, 'zip' => $zip ) = $pipe->get_context();
-
-// 	if ( ! str_ends_with( $zip->get_filename(), '.wxr' ) ) {
-// 		$zip->skip_file();
-// 		continue;
-// 	}
-
-// 	switch( $zip->get_filename() ) {
-// 		case 'site-content.wxr':
-// 			$pipe->write( $xml->get_contents() );
-// 			break;
-// 	}
-// }
-
-// Pipe::run( [
-// 	'http' => new RequestStream( [ /* ... */ ] ),
-// 	'zip'  => new ZipReaderStream( fn ($context) => {
-// 		if(!str_ends_with($context['http']->url, '.zip')) {
-// 			return $context['zip']->skip();
-// 		}
-// 	} ),
-// 	'xml'  => new XMLProcessorStream(fn ($context) => {
-// 		if(!str_ends_with($context['zip']->filename, '.wxr')) {
-// 			return $context['zip']->skip();
-// 		}
-
-// 		$xml_processor = $context['xml']->get_or_create_processor( $context['zip']->filename );
-// 		if(!WXR_Processor::is_content_node($xml_processor)) {
-// 			continue;
-// 		}
-
-// 		// Migrate URLs and downlaod assets
-// 	}),
-// ] );
 
