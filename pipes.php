@@ -148,6 +148,16 @@ class BlockMarkupURLVisitorStream implements ReadableStream {
 
 }
 
+class XML_Processor {
+
+	static public function stream($node_visitor_callback)
+	{
+		return new Demultiplexer(
+			fn() => new XMLProcessorStream($node_visitor_callback)
+		);
+	}
+}
+
 class XMLProcessorStream implements TransformStream {
 	use BaseTransformStream;
 
@@ -252,6 +262,15 @@ class DemultiplexerStream implements TransformStream {
 		return false;
 	}
 
+}
+
+class HttpClient {
+
+	static public function stream($requests)
+	{
+		return new RequestStream($requests);
+	}
+	
 }
 
 class RequestStream implements ReadableStream {
@@ -364,10 +383,18 @@ class FilterStream implements TransformStream {
 	}
 }
 
-class LocalFileStream implements WritableStream, ReadableStream {
+class LocalFileWriter implements WritableStream, ReadableStream {
 	private $error = null;
 	private $filename_factory;
+	private $last_written_chunk;
+	private $buffer;
 	private $fp;
+
+	static public function stream( $filename_factory ) {
+		return new Demultiplexer(
+			fn() => new self( $filename_factory )
+		);
+	}
 
 	public function __construct($filename_factory)
 	{
@@ -382,6 +409,7 @@ class LocalFileStream implements WritableStream, ReadableStream {
 			$this->fp = fopen($filename, 'wb');
 		}
 
+		$this->last_written_chunk = $data;
 		fwrite($this->fp, $data);
 		return true;
 	}
@@ -392,6 +420,11 @@ class LocalFileStream implements WritableStream, ReadableStream {
 
 	// Temporary workaround to keep the Pipe class working
 	public function read(): bool {
+		if($this->last_written_chunk) {
+			$this->buffer = $this->last_written_chunk;
+			$this->last_written_chunk = null;
+			return true;
+		}
 		return false;
 	}
 
@@ -400,6 +433,11 @@ class LocalFileStream implements WritableStream, ReadableStream {
 	}
 
 	public function consume_output(): ?string {
+		if($this->buffer) {
+			$chunk = $this->buffer;
+			$this->buffer = null;
+			return $chunk;
+		}
 		return null;
 	}
 
@@ -437,6 +475,113 @@ class BasicStreamMetadata implements StreamMetadata {
 		return $this->filename;
 	}
 }
+
+class Demultiplexer implements ReadableStream, WritableStream
+{
+
+	public $factory_function;
+	private $stream_instances = [];
+
+	public function __construct(
+		$factory_function
+	) {
+		$this->factory_function = $factory_function;
+	}
+
+	public function write( string $data, ?StreamMetadata $metadata=null ): bool {
+		if ( $this->error ) {
+			return false;
+		}
+
+		$resource_id = $metadata ? $metadata->get_resource_id() : 'default';
+		$stream_factory = $this->factory_function;
+		if(!isset($this->stream_instances[$resource_id])) {
+			$this->stream_instances[$resource_id] = $stream_factory();
+		}
+		$stream = $this->stream_instances[$resource_id];
+		$retval = $stream->write( $data, $metadata );
+		if ( ! $retval ) {
+			$this->error = $stream->get_error();
+		}
+		return $retval;
+	}
+
+	private $read_queue = [];
+	private $last_read_stream = null;
+	private $finished = false;
+	public function read(): bool
+	{
+		$available_streams = count($this->stream_instances);
+		if(0 === $available_streams) {
+			$this->stream_instances = [
+				'default' => ($this->factory_function)()
+			];
+			$available_streams = 1;
+		}
+
+		$processed_streams = 0;
+		do {
+			if (empty($this->read_queue)) {
+				$this->read_queue = $this->stream_instances;
+			}
+
+			$stream = array_shift($this->read_queue);
+			if ($stream->read()) {
+				$this->last_read_stream = $stream;
+				return true;
+			}
+
+			if ( $stream->get_error() ) {
+				$this->error       = $stream->get_error();
+				$this->is_finished = true;
+
+				return false;
+			}
+
+			++$processed_streams;
+
+			if ( $stream->is_finished() ) {
+				// @TODO: Handle this case, track which streams are finished
+				//        and take them off the instances list and the read queue.
+			}
+		} while ($processed_streams < $available_streams);
+		return false;
+	}
+
+	public function consume_output(): ?string {
+		return $this->last_read_stream ? $this->last_read_stream->consume_output() : null;
+	}
+
+	public function get_metadata(): ?StreamMetadata
+	{
+		return $this->last_read_stream ? $this->last_read_stream->get_metadata() : null;
+	}
+
+	public function is_finished(): bool {
+		$finished = true;
+		foreach($this->stream_instances as $stream) {
+			if(!$stream->is_finished()) {
+				$finished = false;
+				break;
+			}
+		}
+		return $finished;
+	}
+
+	protected $error = null;
+
+	protected function set_error( string $error ) {
+		$this->metadata = null;
+		$this->error    = $error ?: 'unknown error';
+		$this->finished = true;
+	}
+
+	public function get_error(): ?string {
+		return $this->error;
+	}
+
+}
+
 
 class Pipe implements ReadableStream, WritableStream {
 	private $stages = [];
