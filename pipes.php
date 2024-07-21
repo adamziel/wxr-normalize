@@ -486,7 +486,7 @@ class FilterStream implements TransformStream {
 
 class LocalFileWriter implements WritableStream, ReadableStream {
 	private $error = null;
-	private $filename_factory;
+	private $file_name_factory;
 	private $last_written_chunk;
 	private $buffer;
 	private $context;
@@ -494,24 +494,24 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 
 	use ReadableStreamIterator;
 
-	static public function stream( $filename_factory ) {
+	static public function stream( $file_name_factory ) {
 		return new Demultiplexer(
-			fn() => new self( $filename_factory )
+			fn() => new self( $file_name_factory )
 		);
 	}
 
-	public function __construct($filename_factory)
+	public function __construct($file_name_factory)
 	{
-		$this->filename_factory = $filename_factory;
+		$this->file_name_factory = $file_name_factory;
 	}
 
 	public function write( string $data, ?StreamedFileContext $context=null ): bool {
 		if ( ! $this->fp ) {
-			$filename_factory = $this->filename_factory;
-			$filename = $filename_factory($context);
-			$this->context = new StreamedFileContext($this, $filename, $filename);
+			$file_name_factory = $this->file_name_factory;
+			$file_name = $file_name_factory($context);
+			$this->context = new StreamedFileContext($this, $file_name, $file_name);
 			// @TODO: we'll need to close this. We could use a close() or cleanup() method here.
-			$this->fp = fopen($filename, 'wb');
+			$this->fp = fopen($file_name, 'wb');
 		}
 
 		$this->last_written_chunk = $data;
@@ -855,14 +855,14 @@ class StreamedFileContext implements ArrayAccess {
 	private $data = [];
 	private $stream;
 	private $file_id;
-	private $filename;
+	private $file_name;
 	private $is_skipped;
 
-	public function __construct(ReadableStream $stream, $file_id = null, $filename=null)
+	public function __construct(ReadableStream $stream, $file_id = null, $file_name=null)
 	{
 		$this->stream = $stream;
 		$this->file_id = $file_id;
-		$this->filename = $filename;
+		$this->file_name = $file_name;
 	}
 
 	public function offsetExists($offset): bool {
@@ -902,14 +902,14 @@ class StreamedFileContext implements ArrayAccess {
 		}
 	}
 
-	public function get_filename() {
-		if($this->filename) {
-			return $this->filename;
+	public function get_file_name() {
+		if($this->file_name) {
+			return $this->file_name;
 		}
 		foreach($this->child_contexts as $context) {
-			$filename = $context->get_filename();
-			if($filename) {
-				return $filename;
+			$file_name = $context->get_file_name();
+			if($file_name) {
+				return $file_name;
 			}
 		}
 	}

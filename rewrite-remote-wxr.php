@@ -86,7 +86,7 @@ $pipe = Pipe::run([
 		//
 		// Otherwise, the asynchronous operation may yield new chunks after the
 		// 'http' stream is finished.
-		if( ! str_ends_with( $context['http']->get_filename(), '.wxr' ) ) {
+		if( ! str_ends_with( $context['http']->get_file_name(), '.wxr' ) ) {
 			$context->skip_file();
 			// Don't emit any data
 			return null;
@@ -109,7 +109,7 @@ $pipe = Pipe::run([
 	// 	continue;
 	// }
 
-	// // if ( ! str_ends_with( $zip->filename, '.wxr' ) ) {
+	// // if ( ! str_ends_with( $zip->file_name, '.wxr' ) ) {
 	// // 	$zip->skip_file();
 	// // 	continue;
 	// // }
