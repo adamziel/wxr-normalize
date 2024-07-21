@@ -95,7 +95,7 @@ $pipe = Pipe::run([
 		// Emit unchanged input data
 		return $chunk;
 	},
-	'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk' ),
+	'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_file_id() . '.chunk' ),
 ] );
 
 

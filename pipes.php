@@ -8,7 +8,7 @@ interface ReadableStream extends Iterator {
 	public function is_finished(): bool;
 	public function consume_output(): ?string;
 	public function get_error(): ?string;
-	public function get_context(): ?StreamedResourceContext;
+	public function get_context(): ?StreamedFileContext;
 	public function on_last_read_file_skipped();
 }
 
@@ -61,7 +61,7 @@ trait BaseReadableStream {
 	protected $error = null;
 	protected $buffer = '';
 	protected $context = null;
-	protected $skipped_resource_id;
+	protected $skipped_file_id;
 
 	public function read(): bool {
 		if ( $this->finished || $this->error ) {
@@ -72,7 +72,7 @@ trait BaseReadableStream {
 		if(
 			$result &&
 			$this->context && 
-			$this->context->get_resource_id() === $this->skipped_resource_id
+			$this->context->get_file_id() === $this->skipped_file_id
 		) {
 			$this->consume_output();
 			return false;
@@ -87,12 +87,12 @@ trait BaseReadableStream {
 	}
 
 	public function on_last_read_file_skipped() {
-		if ($this->context && $this->context->get_resource_id()) {
-			$this->skipped_resource_id = $this->context->get_resource_id();
+		if ($this->context && $this->context->get_file_id()) {
+			$this->skipped_file_id = $this->context->get_file_id();
 		}
 	}
 
-	public function get_context(): ?StreamedResourceContext
+	public function get_context(): ?StreamedFileContext
 	{
 		return $this->context;
 	}
@@ -120,7 +120,7 @@ trait BaseReadableStream {
 }
 
 interface WritableStream {
-	public function write( string $data, ?StreamedResourceContext $context=null ): bool;
+	public function write( string $data, ?StreamedFileContext $context=null ): bool;
 
 	public function get_error(): ?string;
 }
@@ -139,7 +139,7 @@ trait BaseWritableStream {
 	protected $error = null;
 	protected $context = null;
 
-	public function write( string $data, ?StreamedResourceContext $pipe_context=null ): bool {
+	public function write( string $data, ?StreamedFileContext $pipe_context=null ): bool {
 		if ( $this->error ) {
 			return false;
 		}
@@ -147,7 +147,7 @@ trait BaseWritableStream {
 		return $this->doWrite( $data, $pipe_context );
 	}
 
-	abstract protected function doWrite( string $data, ?StreamedResourceContext $context ): bool;
+	abstract protected function doWrite( string $data, ?StreamedFileContext $context ): bool;
 
 	protected function set_error( string $error ) {
 		$this->context = null;
@@ -164,7 +164,7 @@ class BufferStream implements TransformStream {
 
 	use BaseTransformStream;
 
-	protected function doWrite( string $data, ?StreamedResourceContext $context=null ): bool {
+	protected function doWrite( string $data, ?StreamedFileContext $context=null ): bool {
 		$this->buffer .= $data;
 
 		return true;
@@ -227,7 +227,7 @@ class XMLProcessorStream implements TransformStream {
 		$this->node_visitor_callback = $node_visitor_callback;
 	}
 
-	protected function doWrite( string $data, ?StreamedResourceContext $context=null ): bool {
+	protected function doWrite( string $data, ?StreamedFileContext $context=null ): bool {
 		$this->xml_processor->stream_append_xml( $data );
 
 		return true;
@@ -276,9 +276,9 @@ class DemultiplexerStream implements TransformStream {
 		$this->pipe_factory = $pipe_factory;
 	}
 
-	protected function doWrite( string $data, ?StreamedResourceContext $pipe_context=null ): bool {
+	protected function doWrite( string $data, ?StreamedFileContext $pipe_context=null ): bool {
 		// -1 is the default stream ID used whenever we don't have any metadata
-		$stream_id = $pipe_context ? $pipe_context->get_resource_id() : -1;
+		$stream_id = $pipe_context ? $pipe_context->get_file_id() : -1;
 		if ( ! isset( $this->pipes[ $stream_id ] ) ) {
 			$pipe_factory = $this->pipe_factory;
 			$this->pipes[ $stream_id ] = $pipe_factory();
@@ -348,7 +348,7 @@ class RequestStream implements ReadableStream {
 
 		$this->requests = $requests;
 		foreach($requests as $request) {
-			$this->child_contexts[$request->id] = new StreamedResourceContext(
+			$this->child_contexts[$request->id] = new StreamedFileContext(
 				$this,
 				$request->id,
 				$request->url
@@ -379,7 +379,7 @@ class RequestStream implements ReadableStream {
 				$this->set_error( $request->error ?: 'unknown error' );
 				break;
 			case Client::EVENT_FINISHED:
-				// @TODO: Mark this particular resource as finished without
+				// @TODO: Mark this particular file as finished without
 				//        closing the entire Client stream.
 				break;
 		}
@@ -389,8 +389,8 @@ class RequestStream implements ReadableStream {
 	
 	public function on_last_read_file_skipped()
 	{
-		if ($this->get_context() && $this->get_context()->get_resource_id()) {
-			$this->skipped_requests[$this->get_context()->get_resource_id()] = true;
+		if ($this->get_context() && $this->get_context()->get_file_id()) {
+			$this->skipped_requests[$this->get_context()->get_file_id()] = true;
 		}
 	}
 }
@@ -402,7 +402,7 @@ abstract class StringTransformerStream implements TransformStream {
 		return ! empty( $this->buffer );
 	}
 
-	protected function doWrite( string $data, ?StreamedResourceContext $context=null ): bool {
+	protected function doWrite( string $data, ?StreamedFileContext $context=null ): bool {
 		$this->buffer .= $this->transform( $data );
 
 		return true;
@@ -424,7 +424,7 @@ class CallbackStream implements TransformStream {
 		return ! empty( $this->buffer );
 	}
 
-	protected function doWrite( string $chunk, ?StreamedResourceContext $pipe_context=null ): bool {
+	protected function doWrite( string $chunk, ?StreamedFileContext $pipe_context=null ): bool {
 		$callback = $this->callback;
 		$result = $callback( $chunk, $pipe_context );
 		if(null === $result) {
@@ -472,7 +472,7 @@ class FilterStream implements TransformStream {
 		return ! empty( $this->buffer );
 	}
 
-	protected function doWrite( string $data, ?StreamedResourceContext $context=null ): bool {
+	protected function doWrite( string $data, ?StreamedFileContext $context=null ): bool {
 		$filter_callback = $this->filter_callback;
 		if ( $filter_callback( $context ) ) {
 			$this->buffer .= $data;
@@ -505,11 +505,11 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 		$this->filename_factory = $filename_factory;
 	}
 
-	public function write( string $data, ?StreamedResourceContext $context=null ): bool {
+	public function write( string $data, ?StreamedFileContext $context=null ): bool {
 		if ( ! $this->fp ) {
 			$filename_factory = $this->filename_factory;
 			$filename = $filename_factory($context);
-			$this->context = new StreamedResourceContext($this, $filename, $filename);
+			$this->context = new StreamedFileContext($this, $filename, $filename);
 			// @TODO: we'll need to close this. We could use a close() or cleanup() method here.
 			$this->fp = fopen($filename, 'wb');
 		}
@@ -551,7 +551,7 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 		return null;
 	}
 
-	public function get_context(): ?StreamedResourceContext
+	public function get_context(): ?StreamedFileContext
 	{
 		return $this->context;
 	}
@@ -571,17 +571,17 @@ class Demultiplexer implements ReadableStream, WritableStream
 		$this->factory_function = $factory_function;
 	}
 
-	public function write( string $data, ?StreamedResourceContext $pipe_context=null ): bool {
+	public function write( string $data, ?StreamedFileContext $pipe_context=null ): bool {
 		if ( $this->error ) {
 			return false;
 		}
 
-		$resource_id = $pipe_context ? $pipe_context->get_resource_id() : 'default';
+		$file_id = $pipe_context ? $pipe_context->get_file_id() : 'default';
 		$stream_factory = $this->factory_function;
-		if(!isset($this->stream_instances[$resource_id])) {
-			$this->stream_instances[$resource_id] = $stream_factory();
+		if(!isset($this->stream_instances[$file_id])) {
+			$this->stream_instances[$file_id] = $stream_factory();
 		}
-		$stream = $this->stream_instances[$resource_id];
+		$stream = $this->stream_instances[$file_id];
 		$retval = $stream->write( $data, $pipe_context );
 		if ( ! $retval ) {
 			$this->error = $stream->get_error();
@@ -639,7 +639,7 @@ class Demultiplexer implements ReadableStream, WritableStream
 		return $this->last_read_stream ? $this->last_read_stream->consume_output() : null;
 	}
 
-	public function get_context(): ?StreamedResourceContext
+	public function get_context(): ?StreamedFileContext
 	{
 		return $this->last_read_stream ? $this->last_read_stream->get_context() : null;
 	}
@@ -753,7 +753,7 @@ class Pipe implements ReadableStream, WritableStream {
 		$anyDataPiped = false;
 
 		$stages = $this->stages;
-		$this->context = new StreamedResourceContext($this);
+		$this->context = new StreamedFileContext($this);
 		$this->last_read_from_stage = null;
 		for ( $i = 0; $i < count( $stages ) - 1; $i ++ ) {
 			$stage = $stages[ $i ];
@@ -817,12 +817,12 @@ class Pipe implements ReadableStream, WritableStream {
 		return false;
 	}
 
-	public function get_context(): ?StreamedResourceContext
+	public function get_context(): ?StreamedFileContext
 	{
 		return $this->context;		
 	}
 
-	public function write( string $data, ?StreamedResourceContext $pipe_context = null ): bool {
+	public function write( string $data, ?StreamedFileContext $pipe_context = null ): bool {
 		return $this->stages[0]->write( $data, $pipe_context );
 	}
 
@@ -850,18 +850,18 @@ class Pipe implements ReadableStream, WritableStream {
 	}
 }
 
-class StreamedResourceContext implements ArrayAccess {
+class StreamedFileContext implements ArrayAccess {
 	private $child_contexts = [];
 	private $data = [];
 	private $stream;
-	private $resource_id;
+	private $file_id;
 	private $filename;
 	private $is_skipped;
 
-	public function __construct(ReadableStream $stream, $resource_id = null, $filename=null)
+	public function __construct(ReadableStream $stream, $file_id = null, $filename=null)
 	{
 		$this->stream = $stream;
-		$this->resource_id = $resource_id;
+		$this->file_id = $file_id;
 		$this->filename = $filename;
 	}
 
@@ -890,14 +890,14 @@ class StreamedResourceContext implements ArrayAccess {
 		$this->stream->on_last_read_file_skipped();
 	}
 
-	public function get_resource_id() {
-		if($this->resource_id) {
-			return $this->resource_id;
+	public function get_file_id() {
+		if($this->file_id) {
+			return $this->file_id;
 		}
 		foreach($this->child_contexts as $context) {
-			$resource_id = $context->get_resource_id();
-			if($resource_id) {
-				return $resource_id;
+			$file_id = $context->get_file_id();
+			if($file_id) {
+				return $file_id;
 			}
 		}
 	}
