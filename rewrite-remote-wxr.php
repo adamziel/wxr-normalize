@@ -70,29 +70,39 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 
 // @TODO: Implement the commented out parts
 
-$pipe = Pipe::from( [
-	'http' => HttpClient::stream( [
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini' ),
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml' ),
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml?a' ),
-		new Request( 'https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr' ),
-	] ),
-	XML_Processor::stream( $rewrite_links_in_wxr_node ),
-	// function ($context) {
-		// if ( ! str_ends_with( $zip->filename, '.wxr' ) ) {
-		// 	$zip->skip_file();
-		// }
-	// },
+$pipe = Pipe::run([
+	'http' => HttpClient::stream([
+		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini'),
+		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini'),
+		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml'),
+		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml?a'),
+		new Request('https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr'),
+		new Request('https://raw.githubusercontent.com/wpaccessibility/a11y-theme-unit-test/master/a11y-theme-unit-test-data.xml'),
+	]),
+	XML_Processor::stream($rewrite_links_in_wxr_node),
+	function ($chunk, $context) {
+		// $context['http'] is guaranteed to be present if there are no
+		// asynchronous streams between the HttpClient stream and here.
+		//
+		// Otherwise, the asynchronous operation may yield new chunks after the
+		// 'http' stream is finished.
+		if( ! str_ends_with( $context['http']->get_filename(), '.wxr' ) ) {
+			$context->skip_file();
+			// Don't emit any data
+			return null;
+		}
+
+		// Emit unchanged input data
+		return $chunk;
+	},
 	'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_resource_id() . '.chunk' ),
 ] );
 
-// var_dump($pipe);
 
-foreach($pipe as $context) {
-	list( 'http' => $http, 'file' => $file ) = $context;
+// foreach($pipe as $context) {
+// 	list( 'http' => $http, 'file' => $file ) = $context;
 	// print_r($http);
-	print_r($file);
+	// print_r($file);
 
 	// if ( $context->is_failure() ) {
 	// 	echo 'Failed to download ' . $http->url . ': ' . $context->get_error_message();
@@ -105,5 +115,5 @@ foreach($pipe as $context) {
 	// // }
 
 	// echo 'Saved ' . $http->url . ' to ' . $file->file_path;
-}
+// }
 
