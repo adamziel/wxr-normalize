@@ -126,7 +126,7 @@ class Uppercaser extends Process {
     }
 }
 
-class Composite extends Process {
+class ShellCommandsChain extends Process {
     public array $process_factories;
     public $subprocesses = [];
     private $reaped_pids = [];
@@ -190,7 +190,7 @@ class Composite extends Process {
     }
 }
 
-$process = ProcessManager::spawn(fn () => new Composite([
+$process = ProcessManager::spawn(fn () => new ShellCommandsChain([
     'hello' => fn() => new HelloWorld(),
     'upper' => fn() => new Uppercaser()
 ]));
