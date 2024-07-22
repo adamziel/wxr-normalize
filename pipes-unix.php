@@ -99,7 +99,7 @@ abstract class TransformProcess extends Process {
         }
 
         $data = $this->stdin->read();
-        if (false === $data) {
+        if (null === $data || false === $data) {
             return;
         }
         $this->stdout->write($this->transform($data, $tick_context));
@@ -389,7 +389,7 @@ class Demultiplexer extends Process {
         }
 
         $next_chunk = $this->stdin->read();
-        if(false === $next_chunk) {
+        if(null === $next_chunk || false === $next_chunk) {
             return;
         }
 
@@ -493,8 +493,8 @@ class ShellCommandsChain extends Process {
 
 $process = ProcessManager::spawn(fn () => new ShellCommandsChain([
     'http' => fn() => new FakeHttpClient(),
-    // 'uc' => fn() => new Uppercaser(),
-    'upper' => fn() => new Demultiplexer(fn() => new Uppercaser())
+    'uc' => fn() => new Uppercaser(),
+    // 'upper' => fn() => new Demultiplexer(fn() => new Uppercaser())
 ]));
 
 $i = 0;
