@@ -64,6 +64,8 @@ trait BaseReadableStream {
 	protected $skipped_file_id;
 
 	public function read(): bool {
+		$this->context = null;
+
 		if ( $this->finished || $this->error ) {
 			return false;
 		}
@@ -111,7 +113,6 @@ trait BaseReadableStream {
 	protected function set_error( string $error ) {
 		$this->error    = $error ?: 'unknown error';
 		$this->finished = true;
-		$this->context = null;
 	}
 
 	public function get_error(): ?string {
@@ -279,12 +280,29 @@ class DemultiplexerStream implements TransformStream {
 	protected function doWrite( string $data, ?StreamedFileContext $pipe_context=null ): bool {
 		// -1 is the default stream ID used whenever we don't have any metadata
 		$stream_id = $pipe_context ? $pipe_context->get_file_id() : -1;
+
 		if ( ! isset( $this->pipes[ $stream_id ] ) ) {
 			$pipe_factory = $this->pipe_factory;
 			$this->pipes[ $stream_id ] = $pipe_factory();
 		}
 
 		return $this->pipes[ $stream_id ]->write( $data, $pipe_context );
+	}
+
+	public function on_upstream_error(StreamedFileContext $pipe_context)
+	{
+		$stream_id = $pipe_context ? $pipe_context->get_file_id() : -1;
+		if(!$pipe_context->get_error()) {
+			return;
+		}
+		// Clean up the child stream if needed
+		if (!isset($this->pipes[$stream_id])) {
+			return;
+		}
+
+		$pipe = $this->pipes[$stream_id];
+		$pipe->on_upstream_error($pipe_context);
+		$this->context = $pipe->get_context();
 	}
 
 	protected function doRead(): bool {
@@ -341,6 +359,7 @@ class RequestStream implements ReadableStream {
 	private $requests = [];
 	private $child_contexts = [];
 	private $skipped_requests = [];
+	private $errors = [];
 
 	public function __construct( $requests ) {
 		$this->client = new Client();
@@ -374,17 +393,41 @@ class RequestStream implements ReadableStream {
 				$this->buffer .= $this->client->get_response_body_chunk();
 				return true;
 			case Client::EVENT_FAILED:
-				// @TODO: Handling errors.
-				//        We don't want to stop everything if one request fails.
-				$this->set_error( $request->error ?: 'unknown error' );
-				break;
+				$this->context->skip_file();
+				$this->set_child_error($request->error);
+				return false;
 			case Client::EVENT_FINISHED:
-				// @TODO: Mark this particular file as finished without
-				//        closing the entire Client stream.
-				break;
+				$this->set_child_finished();
+				return false;
 		}
 
 		return false;
+	}
+
+	protected function set_child_finished()
+	{
+		$this->context->set_finished();
+		
+		foreach( $this->child_contexts as $context ) {
+			if(!$context->is_finished()) {
+				return;
+			}
+		}
+
+		$this->finished = true;
+	}
+
+	protected function set_child_error($error)
+	{
+		$this->context->set_error($error);
+
+		foreach( $this->child_contexts as $context ) {
+			if(!$context->get_error()) {
+				return;
+			}
+		}
+
+		$this->set_error('All child requests failed');
 	}
 	
 	public function on_last_read_file_skipped()
@@ -525,6 +568,7 @@ class LocalFileWriter implements WritableStream, ReadableStream {
 
 	// Temporary workaround to keep the Pipe class working
 	public function read(): bool {
+		$this->context = null;
 		if($this->last_written_chunk) {
 			$this->buffer = $this->last_written_chunk;
 			$this->last_written_chunk = null;
@@ -572,21 +616,17 @@ class Demultiplexer implements ReadableStream, WritableStream
 	}
 
 	public function write( string $data, ?StreamedFileContext $pipe_context=null ): bool {
-		if ( $this->error ) {
-			return false;
-		}
-
 		$file_id = $pipe_context ? $pipe_context->get_file_id() : 'default';
 		$stream_factory = $this->factory_function;
 		if(!isset($this->stream_instances[$file_id])) {
 			$this->stream_instances[$file_id] = $stream_factory();
 		}
 		$stream = $this->stream_instances[$file_id];
-		$retval = $stream->write( $data, $pipe_context );
-		if ( ! $retval ) {
-			$this->error = $stream->get_error();
-		}
-		return $retval;
+
+		// We don't check whether the write succeeded.
+		// The child streams handle their own errors.
+		$stream->write( $data, $pipe_context );
+		return true;
 	}
 
 	private $read_queue = [];
@@ -612,22 +652,21 @@ class Demultiplexer implements ReadableStream, WritableStream
 			}
 
 			$stream = array_shift($this->read_queue);
-			if ( $stream->is_finished() ) {
-				$index = array_search($stream, $this->stream_instances, true);
-				unset($this->stream_instances[$index]);
-				continue;
-			}
-
 			if ($stream->read()) {
 				$this->last_read_stream = $stream;
 				return true;
 			}
 
-			if ( $stream->get_error() ) {
-				$this->error       = $stream->get_error();
-				$this->is_finished = true;
+			if ($stream->is_finished()) {
+				$index = array_search($stream, $this->stream_instances, true);
+				unset($this->stream_instances[$index]);
 
-				return false;
+				// Don't do anything when the child stream errors out.
+				// We may soon receive more files to demultiplex so we 
+				// don't want to trash the entire Demultiplexer stream.
+				//
+				// Error details are available in the chunk context.
+				continue;
 			}
 
 			++$processed_streams;
@@ -648,16 +687,19 @@ class Demultiplexer implements ReadableStream, WritableStream
 		return count($this->stream_instances) === 0;
 	}
 
-	protected $error = null;
-
-	protected function set_error( string $error ) {
-		$this->context = null;
-		$this->error    = $error ?: 'unknown error';
-		$this->finished = true;
-	}
-
+	/**
+	 * Demultiplexer does not have an error state even if
+	 * all of the child streams error out. This is because
+	 * we don't know upfront whether more files will be streamed
+	 * to the demultiplexer later.
+	 * 
+	 * Demultiplexed streams have their own error states and
+	 * the error details are available in the streamed file context.
+	 * 
+	 * @return null
+	 */
 	public function get_error(): ?string {
-		return $this->error;
+		return null;
 	}
 
 	public function on_last_read_file_skipped() {
@@ -668,7 +710,7 @@ class Demultiplexer implements ReadableStream, WritableStream
 }
 
 
-class Pipe implements ReadableStream, WritableStream {
+class UnixPipe implements ReadableStream, WritableStream {
 	private $stages_keys = [];
 	private $stages = [];
 	private $error = null;
@@ -696,7 +738,7 @@ class Pipe implements ReadableStream, WritableStream {
 		$options = array_merge([
 			'buffer_output' => false,
 		], $options);
-		$pipe = Pipe::from( $stages );
+		$pipe = UnixPipe::from( $stages );
 
 		while ( ! $pipe->is_finished() ) {
 			if ( ! $pipe->read() ) {
@@ -747,6 +789,8 @@ class Pipe implements ReadableStream, WritableStream {
 
 	private $context_history = [];
 	public function read(): bool {
+		$this->context = null;
+
 		if($this->finished) {
 			return false;
 		}
@@ -755,6 +799,7 @@ class Pipe implements ReadableStream, WritableStream {
 		$stages = $this->stages;
 		$this->context = new StreamedFileContext($this);
 		$this->last_read_from_stage = null;
+		$mode = 'pipe_data'; // or pipe_error
 		for ( $i = 0; $i < count( $stages ) - 1; $i ++ ) {
 			$stage = $stages[ $i ];
 			$this->last_read_from_stage = $i;
@@ -764,18 +809,27 @@ class Pipe implements ReadableStream, WritableStream {
 				if ( ! $stage->read() ) {
 					if ( $stage->get_error() ) {
 						$this->error       = $stage->get_error();
-						$this->is_finished = true;
+						$this->finished = true;
 
 						return false;
 					}
 
-					if ( $stage->is_finished() ) {
+					// @TODO pipe the error through the next stages
+					//       so they can clean up resources. 
+					// @TODO separately, output the error from the current pipe
+					//       so that the caller can handle it.
+					if($stage->get_context() && $stage->get_context()->get_error()) {
+						// Propagate the error through the next stages
+						$mode = 'pipe_error';
+					} else {
+						if ($stage->is_finished()) {
+							continue;
+						}
+
+						// No data was produced by the stage, let's try again on the next read() call,
+						// and meanwhile let's see if the rest of the pipe will produce any data.
 						continue;
 					}
-
-					// No data was produced by the stage, let's try again on the next read() call,
-					// and meanwhile let's see if the rest of the pipe will produce any data.
-					continue;
 				}
 				$data = $stage->consume_output();
 				if ( null === $data ) {
@@ -857,6 +911,8 @@ class StreamedFileContext implements ArrayAccess {
 	private $file_id;
 	private $file_name;
 	private $is_skipped;
+	private $is_finished;
+	private $error;
 
 	public function __construct(ReadableStream $stream, $file_id = null, $file_name=null)
 	{
@@ -885,9 +941,28 @@ class StreamedFileContext implements ArrayAccess {
 		return $this->stream;
 	}
 
+	public function set_error($error) {
+		$this->error = $error;
+	}
+
+	public function get_error() {
+		return $this->error;
+	}
+
 	public function skip_file() {
 		$this->is_skipped = true;
+		$this->set_finished();
 		$this->stream->on_last_read_file_skipped();
+	}
+
+	public function is_finished()
+	{
+		return $this->is_finished;
+	}
+
+	public function set_finished()
+	{
+		$this->is_finished = true;		
 	}
 
 	public function get_file_id() {
@@ -1049,3 +1124,5 @@ function composeIterators(array $iterators): Generator {
 
     return generatorCompose($iterators, 0);
 }
+
+

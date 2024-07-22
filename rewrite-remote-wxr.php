@@ -53,7 +53,7 @@ use \WordPress\AsyncHttp\Request;
 $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 	if (is_wxr_content_node($processor)) {
 		$text = $processor->get_modifiable_text();
-		$updated_text = Pipe::get_output([
+		$updated_text = UnixPipe::get_output([
 			new BlockMarkupURLRewriteStream(
 				$text,
 				[
@@ -70,33 +70,38 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 
 // @TODO: Implement the commented out parts
 
-$pipe = Pipe::run([
-	'http' => HttpClient::stream([
-		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini'),
-		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini'),
-		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml'),
-		new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/phpcs.xml?a'),
-		new Request('https://raw.githubusercontent.com/WordPress/blueprints/trunk/blueprints/stylish-press/site-content.wxr'),
-		new Request('https://raw.githubusercontent.com/wpaccessibility/a11y-theme-unit-test/master/a11y-theme-unit-test-data.xml'),
-	]),
-	XML_Processor::stream($rewrite_links_in_wxr_node),
-	function ($chunk, $context) {
-		// $context['http'] is guaranteed to be present if there are no
-		// asynchronous streams between the HttpClient stream and here.
-		//
-		// Otherwise, the asynchronous operation may yield new chunks after the
-		// 'http' stream is finished.
-		if( ! str_ends_with( $context['http']->get_file_name(), '.wxr' ) ) {
-			$context->skip_file();
-			// Don't emit any data
-			return null;
-		}
+$pipe = UnixPipe::run(
+	[
+		'http' => HttpClient::stream([
+			new Request('https://raw.githubusercontent.com/WordPress/blueprints-library/trunk/php.ini'),
+			new Request('https://127.0.0.1:80'),
+		]),
+		XML_Processor::stream($rewrite_links_in_wxr_node),
+		function ($chunk, $context) {
+			var_dump(get_class($context));
+			// $context['http'] is guaranteed to be present if there are no
+			// asynchronous streams between the HttpClient stream and here.
+			//
+			// Otherwise, the asynchronous operation may yield new chunks after the
+			// 'http' stream is finished.
+			if( ! str_ends_with( $context['http']->get_file_name(), '.ini' ) ) {
+				$context->skip_file();
+				// Don't emit any data
+				return null;
+			}
 
-		// Emit unchanged input data
-		return $chunk;
-	},
-	'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_file_id() . '.chunk' ),
-] );
+			// Emit unchanged input data
+			return $chunk;
+		},
+		'file' => LocalFileWriter::stream( fn ($context) => __DIR__ . '/output/' . $context->get_file_id() . '.chunk' ),
+	],
+	[
+		// 'error_behavior' => Pipe::BREAK_ON_ERROR | Pipe::CONTINUE_ON_ERROR,
+		'on_error' => function ($error) {
+
+		},
+	]
+);
 
 
 // foreach($pipe as $context) {
