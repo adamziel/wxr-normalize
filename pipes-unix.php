@@ -588,7 +588,21 @@ class ZipReaderProcess extends Process {
                         }
                         $this->stdout->write($this->reader->get_file_body_chunk(), [
                             'file_id' => $file_path,
-                            'channel' => $file_path //$input_channel,
+                            // We don't want any single chunk to contain mixed bytes from
+                            // multiple files.
+                            // 
+                            // Therefore, we must either:
+                            // 
+                            // * Use a separate channel for each file to have distinct
+                            //   buckets that don't mix.
+                            // * Use a single channel and ensure the unzipped file is fully
+                            //   written and consumed before we start writing the next file.
+                            // 
+                            // The second option requires more implementation complexity and also
+                            // requires checking whether the output pipe has been read completely
+                            // which is very specific to a BufferPipe. The first option seems simpler
+                            // so let's go with that.
+                            'channel' => $file_path,
                         ]);
                         break;
                 }
