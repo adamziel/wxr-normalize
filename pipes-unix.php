@@ -43,6 +43,15 @@ abstract class Process {
     public Pipe $stderr;
     public $pid;
 
+    public function run()
+    {
+        do {
+            $this->tick();
+            // @TODO: Implement error handling
+            log_process_chain_errors($this);
+        } while ($this->is_alive());
+    }
+
     public function tick($tick_context=null) {
         if(!$this->is_alive()) {
             return;
@@ -870,12 +879,7 @@ $process = ProcessManager::spawn(
     ])
 );
 $process->stdout = new FilePipe('php://stdout', 'w');
-
-$i = 0;
-do {
-    $process->tick();
-    log_process_chain_errors($process);
-} while ($process->is_alive());
+$process->run();
 
 function log_process_chain_errors($process) {
     $error = $process->stderr->read();
