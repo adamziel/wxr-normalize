@@ -117,7 +117,6 @@ abstract class Process {
         $this->stdin = $stdin ?? new MultiChannelPipe();
         $this->stdout = $stdout ?? new MultiChannelPipe();
         $this->stderr = $stderr ?? new BufferPipe();
-        $this->init();
     }
 
     public function run()
@@ -169,9 +168,6 @@ abstract class Process {
         return $this->exit_code === null;
     }
 
-    protected function init() {
-    }
-
     protected function cleanup() {
         // clean up resources
     }
@@ -199,10 +195,6 @@ abstract class TransformProcess extends Process {
             if (null === $transformed || false === $transformed) {
                 break;
             }
-            if (!$this->stdout->has_channel($this->stdin->get_current_channel())) {
-                $this->stdout->add_channel($this->stdin->get_current_channel());
-            }
-            $this->stdout->set_write_channel($this->stdin->get_current_channel());
             $this->stdout->write($transformed, $this->stdin->get_metadata());
         }
     }
@@ -327,7 +319,6 @@ class MultiChannelPipe implements Pipe {
     public $metadata;
     private array $channels = [];
     private ?string $last_read_channel = 'default';
-    private ?string $current_channel = 'default';
 
     public function __construct()
     {
@@ -354,7 +345,7 @@ class MultiChannelPipe implements Pipe {
             if ($data === false || $data === null) {
                 continue;
             }
-            $this->last_read_channel = $this->current_channel = $channel_name;
+            $this->last_read_channel = $channel_name;
             $this->metadata = $this->channels[$channel_name]->get_metadata();
             return $data;
         }
@@ -391,33 +382,33 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function write(string $data, $metadata = null) {
-        if (!isset($this->channels[$this->current_channel])) {
-            return false;
+        $current_channel = 'default';
+
+        if(is_array($metadata) && isset($metadata['channel'])) {
+            $current_channel = $metadata['channel'];
         }
 
-        $this->channels[$this->current_channel]->write($data, $metadata);
-        return true;
+        if (!isset($this->channels[$current_channel])) {
+            $this->channels[$current_channel] = new BufferPipe();
+        }
+
+        return $this->channels[$current_channel]->write($data, $metadata);
+    }
+
+    public function ensure_channel($channel_name)
+    {
+        if (isset($this->channels[$channel_name])) {
+            return false;
+        }
+        $this->channels[$channel_name] = new BufferPipe();
     }
 
     public function close_channel($channel_name)
     {
-        $this->current_channel = null;
+        if (!isset($this->channels[$channel_name])) {
+            return false;
+        }
         return $this->channels[$channel_name]->close();
-    }
-
-    public function set_write_channel($name)
-    {
-        $this->current_channel = $name;
-    }
-
-    public function has_channel($name)
-    {
-        return isset($this->channels[$name]);        
-    }
-
-    public function get_current_channel()
-    {
-        return $this->current_channel;
     }
 
     public function get_channel_pipe($index)
@@ -491,9 +482,9 @@ class Demultiplexer extends Process {
                 break;
             }
 
-            $input_channel = $this->stdin->get_current_channel();
+            $metadata = $this->stdin->get_metadata();
+            $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
             if (!isset($this->subprocesses[$input_channel])) {
-                $this->stdout->add_channel($input_channel);
                 $factory = $this->process_factory;
                 $this->subprocesses[$input_channel] = $factory();
             }
@@ -505,8 +496,10 @@ class Demultiplexer extends Process {
 
             $output = $subprocess->stdout->read();
             if (null !== $output && false !== $output) {
-                $this->stdout->set_write_channel($input_channel);
-                $this->stdout->write($output, $subprocess->stdout->get_metadata());
+                $this->stdout->write($output, array_merge(
+                    $subprocess->stdout->get_metadata() ?? [],
+                    ['channel' => $input_channel]
+                ));
             }
 
             if (!$subprocess->is_alive()) {
@@ -544,7 +537,8 @@ class ZipReaderProcess extends Process {
         return fn () => new Demultiplexer(fn() => new ZipReaderProcess());
     }
 
-    protected function init() {
+    protected function __construct() {
+        parent::__construct();
         $this->reader = new ZipStreamReader('');
     }
 
@@ -573,12 +567,9 @@ class ZipReaderProcess extends Process {
                         if ($this->last_skipped_file === $file_path) {
                             break;
                         }
-                        if (!$this->stdout->has_channel($file_path)) {
-                            $this->stdout->add_channel($file_path);
-                        }
-                        $this->stdout->set_write_channel($file_path);
                         $this->stdout->write($this->reader->get_file_body_chunk(), [
-                            'file_id' => $file_path
+                            'file_id' => $file_path,
+                            'channel' => $file_path,
                         ]);
                         break;
                 }
@@ -630,26 +621,22 @@ class TickContext implements ArrayAccess {
 }
 
 class ProcessChain extends Process {
-    public array $process_factories;
     private $first_subprocess;
     private $last_subprocess;
     public $subprocesses = [];
     private $reaped_pids = [];
 
     public function __construct($process_factories) {
-        $this->process_factories = $process_factories;
         parent::__construct();
-    }
 
-    protected function init() {
         $last_process = null;
-        $names = array_keys($this->process_factories);
+        $names = array_keys($process_factories);
         foreach($names as $k => $name) {
             $names[$k] = $name . '';
         }
 
-        $processes = array_values($this->process_factories);
-        for($i = 0; $i < count($this->process_factories); $i++) {
+        $processes = array_values($process_factories);
+        for($i = 0; $i < count($process_factories); $i++) {
             $factory = $processes[$i];
             $subprocess = $factory();
             if(null !== $last_process) {
@@ -660,7 +647,7 @@ class ProcessChain extends Process {
         }
 
         $this->first_subprocess = $this->subprocesses[$names[0]];
-        $this->last_subprocess = $this->subprocesses[$names[count($this->process_factories) - 1]];
+        $this->last_subprocess = $this->subprocesses[$names[count($process_factories) - 1]];
     }
 
     protected function do_tick($tick_context) {
@@ -734,7 +721,16 @@ class HttpClientProcess extends Process {
 		$this->client = new Client();
 		$this->client->enqueue( $requests );
 
-        parent::__construct();        
+        parent::__construct();
+
+        // Pre-open all output channels to ensure the stdout stream
+        // stays open until all the requests conclude. Otherwise,
+        // we could have a window of time when some requests are done,
+        // others haven't started outputting yet, and the stdout stream
+        // is considered EOF.
+        foreach($requests as $request) {
+            $this->stdout->ensure_channel('request_' . $request->id);
+        }
 	}
 
     protected function do_tick($tick_context)
@@ -746,14 +742,10 @@ class HttpClientProcess extends Process {
 
 		$request = $this->client->get_request();
         $output_channel = 'request_' . $request->id;
-        if (!$this->stdout->has_channel($output_channel)) {
-            $this->stdout->add_channel($output_channel);
-        }
-        $this->stdout->set_write_channel($output_channel);
-
 		switch ( $this->client->get_event() ) {
 			case Client::EVENT_BODY_CHUNK_AVAILABLE:
                 $this->stdout->write($this->client->get_response_body_chunk(), [
+                    'channel' => $output_channel,
                     'request' => $request
                 ]);
 				break;
