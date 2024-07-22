@@ -1,5 +1,41 @@
 <?php
 
+/**
+ * @TODO:
+ * 
+ * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
+ *   I only used it to make the development easier, I got confused with the other attempt in
+ *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
+ * * Make Process implement the Iterator interface
+ * * The process `do_tick` method typically checks for `stdin->is_eof()` and then
+ *   whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
+ * * Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
+ * * Get rid of ProcessManager
+ * * Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
+ * * Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
+ * * Explore semantic updates to metadata:
+ *   * Exposing metadata on a stream instance instead of a pipe
+ *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
+ * * Demultiplexing modes: per input channel, per $metadata['file_id'].
+ * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
+ *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
+ *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
+ *   And it would keep track of eofs etc using a set of internal Pipe instances?
+ * * Calling get_metadata() without calling read() first returns the last metadata. This
+ *   bit me a few times when I was in a context where I could not call read() first because,
+ *   e.g. another process was about to do that. Maybe this is a good thing, as it forces us
+ *   to split a pipe in two whenever an intermediate read is involved, e.g. Process A wouldn't
+ *   just connect it's stdin to a subprocess A.1, but it would read from stdin, read metadata,
+ *   do processing, ant only then write to A.1 stdin. Still, a better error reporting wouldn't hurt.
+ * * Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
+ *   but let's still add it for a moment just to make sure we're not missing any typed return.
+ * * Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
+ * * Pipe::read() returns a string on success, false on failure, or null if there were no writes
+ *   since the last read and we'd just return an empty string. This three-state semantics is useful,
+ *   but it's painful to always check for false and null, and then it may not interop well with
+ *   PHP streams where fread() never returns null. Let's think this through some more.
+ */
+
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
