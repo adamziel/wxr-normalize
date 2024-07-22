@@ -10,7 +10,7 @@
  * * The process `do_tick` method typically checks for `stdin->is_eof()` and then
  *   whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
  * * Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
- * * Get rid of ProcessManager
+ * * ✅ Get rid of ProcessManager
  * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
  *      Let's keep stderr after all.
  * * ✅ Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
@@ -105,45 +105,20 @@
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
-class ProcessManager {
-
-    static private $last_pid = 1;
-    static private $process_table = [];
-    static private $reaped_pids = [];
-
-    static public function spawn($factory_or_process, $stdin=null, $stdout=null, $stderr=null) {
-        $process = $factory_or_process instanceof Process ? $factory_or_process : $factory_or_process();
-        $process->stdin = $stdin ?? new MultiChannelPipe();
-        $process->stdout = $stdout ?? new MultiChannelPipe();
-        $process->stderr = $stderr ?? new BufferPipe();
-        $process->pid = self::$last_pid++;
-        $process->init();
-        self::$process_table[$process->pid] = $process;
-        return $process;
-    }
-
-    static public function kill($pid, $code) {
-        self::$process_table[$pid]->kill($code);
-    }
-
-    static public function reap($pid) {
-        self::$reaped_pids[] = $pid;
-        self::$process_table[$pid]->cleanup();
-        unset(self::$process_table[$pid]);
-    }
-
-    static public function is_reaped($pid) {
-        return in_array($pid, self::$reaped_pids);
-    }
-
-}
-
 abstract class Process {
-    public ?int $exit_code = null;
+    private ?int $exit_code = null;
+    private bool $is_reaped = false;
     public Pipe $stdin;
     public Pipe $stdout;
     public Pipe $stderr;
-    public $pid;
+
+    public function __construct($stdin=null, $stdout=null, $stderr=null)
+    {
+        $this->stdin = $stdin ?? new MultiChannelPipe();
+        $this->stdout = $stdout ?? new MultiChannelPipe();
+        $this->stderr = $stderr ?? new BufferPipe();
+        $this->init();
+    }
 
     public function run()
     {
@@ -171,6 +146,21 @@ abstract class Process {
         $this->stderr->close();
     }
 
+    public function reap()
+    {
+        if($this->is_alive()) {
+            return false;
+        }
+        $this->is_reaped = true;
+        $this->cleanup();
+        return true;        
+    }
+
+    public function is_reaped()
+    {
+        return $this->is_reaped;        
+    }
+
     public function has_crashed() {
         return $this->exit_code !== null && $this->exit_code !== 0;
     }
@@ -179,10 +169,10 @@ abstract class Process {
         return $this->exit_code === null;
     }
 
-    public function init() {
+    protected function init() {
     }
 
-    public function cleanup() {
+    protected function cleanup() {
         // clean up resources
     }
 
@@ -470,6 +460,7 @@ class CallbackProcess extends TransformProcess {
 
     private function __construct($callback) {
         $this->callback = $callback;
+        parent::__construct();
     }
 
     protected function transform($data, $tick_context) {
@@ -485,6 +476,7 @@ class Demultiplexer extends Process {
     private $last_subprocess = [];
     public function __construct($process_factory) {
         $this->process_factory = $process_factory;
+        parent::__construct();
     }
 
     protected function do_tick($tick_context) {
@@ -502,9 +494,8 @@ class Demultiplexer extends Process {
             $input_channel = $this->stdin->get_current_channel();
             if (!isset($this->subprocesses[$input_channel])) {
                 $this->stdout->add_channel($input_channel);
-                $this->subprocesses[$input_channel] = ProcessManager::spawn(
-                    $this->process_factory
-                );
+                $factory = $this->process_factory;
+                $this->subprocesses[$input_channel] = $factory();
             }
 
             $subprocess = $this->subprocesses[$input_channel];
@@ -553,7 +544,7 @@ class ZipReaderProcess extends Process {
         return fn () => new Demultiplexer(fn() => new ZipReaderProcess());
     }
 
-    public function init() {
+    protected function init() {
         $this->reader = new ZipStreamReader('');
     }
 
@@ -647,9 +638,10 @@ class ProcessChain extends Process {
 
     public function __construct($process_factories) {
         $this->process_factories = $process_factories;
+        parent::__construct();
     }
 
-    public function init() {
+    protected function init() {
         $last_process = null;
         $names = array_keys($this->process_factories);
         foreach($names as $k => $name) {
@@ -659,10 +651,10 @@ class ProcessChain extends Process {
         $processes = array_values($this->process_factories);
         for($i = 0; $i < count($this->process_factories); $i++) {
             $factory = $processes[$i];
-            $subprocess = ProcessManager::spawn(
-                $factory, 
-                null !== $last_process ?$last_process->stdout : null
-            );
+            $subprocess = $factory();
+            if(null !== $last_process) {
+                $subprocess->stdin = $last_process->stdout;
+            }
             $this->subprocesses[$names[$i]] = $subprocess;
             $last_process = $subprocess;
         }
@@ -690,8 +682,8 @@ class ProcessChain extends Process {
             }
 
             if($process->has_crashed()) {
-                if (!ProcessManager::is_reaped($process->pid)) {
-                    ProcessManager::reap($process->pid);
+                if (!$process->is_reaped()) {
+                    $process->reap();
                     $this->stderr->write("Process $name has crashed with code {$process->exit_code}", [
                         'type' => 'crash',
                         'process' => $process,
@@ -741,6 +733,8 @@ class HttpClientProcess extends Process {
 	private function __construct( $requests ) {
 		$this->client = new Client();
 		$this->client->enqueue( $requests );
+
+        parent::__construct();        
 	}
 
     protected function do_tick($tick_context)
@@ -791,6 +785,7 @@ class XMLProcess extends TransformProcess {
 	private function __construct( $node_visitor_callback ) {
 		$this->xml_processor         = new WP_XML_Processor( '', [], WP_XML_Processor::IN_PROLOG_CONTEXT );
 		$this->node_visitor_callback = $node_visitor_callback;
+        parent::__construct();
 	}
 
     protected function transform($data, $tick_context)
@@ -866,31 +861,30 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 require __DIR__ . '/bootstrap.php';
 
 
-$process = ProcessManager::spawn(
-    new ProcessChain([
-        HttpClientProcess::stream([
-            new Request('http://127.0.0.1:9864/export.wxr.zip'),
-            // Bad request, will fail:
-            new Request('http://127.0.0.1:9865'),
-        ]),
-
-        'zip' => ZipReaderProcess::stream(),
-        CallbackProcess::stream(function ($data, $context, $process) {
-            if($context['zip']['file_id'] === 'content.xml') {
-                $context['zip']->skip_file('content.xml');
-                return null;
-            }
-            return $data;
-        }),
-        XMLProcess::stream($rewrite_links_in_wxr_node),
-        Uppercaser::stream(),
+$process = new ProcessChain([
+    HttpClientProcess::stream([
+        new Request('http://127.0.0.1:9864/export.wxr.zip'),
+        // Bad request, will fail:
+        new Request('http://127.0.0.1:9865'),
     ]),
-);
+
+    'zip' => ZipReaderProcess::stream(),
+    CallbackProcess::stream(function ($data, $context, $process) {
+        if ($context['zip']['file_id'] === 'content.xml') {
+            $context['zip']->skip_file('content.xml');
+            return null;
+        }
+        return $data;
+    }),
+    XMLProcess::stream($rewrite_links_in_wxr_node),
+    Uppercaser::stream(),
+]);
 $process->stdout = new FilePipe('php://stdout', 'w');
 $process->stderr = new FilePipe('php://stderr', 'w');
 $process->run();
 
 function log_process_chain_errors($process) {
+    return;
     if(!($process->stderr instanceof BufferPipe)) {
         return;
     }
