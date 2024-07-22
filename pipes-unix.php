@@ -317,13 +317,9 @@ class FilePipe extends ResourcePipe {
  */
 class MultiChannelPipe implements Pipe {
     public $metadata;
+    private $used = false;
     private array $channels = [];
     private ?string $last_read_channel = 'default';
-
-    public function __construct()
-    {
-        $this->add_channel('default');
-    }
 
     public function add_channel(string $name, $pipe = null) {
         if(isset($this->channels[$name])) {
@@ -382,6 +378,7 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function write(string $data, $metadata = null) {
+        $this->used = true;
         $current_channel = 'default';
 
         if(is_array($metadata) && isset($metadata['channel'])) {
@@ -403,6 +400,14 @@ class MultiChannelPipe implements Pipe {
         $this->channels[$channel_name] = new BufferPipe();
     }
 
+    public function is_channel_eof($channel_name)
+    {
+        if (!isset($this->channels[$channel_name])) {
+            return false;
+        }
+        return $this->channels[$channel_name]->is_eof();
+    }
+
     public function close_channel($channel_name)
     {
         if (!isset($this->channels[$channel_name])) {
@@ -417,6 +422,9 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function is_eof() {
+        if(!$this->used) {
+            return false;
+        }
         foreach ($this->channels as $pipe) {
             if (!$pipe->is_eof()) {
                 return false;
@@ -426,6 +434,7 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function close() {
+        $this->used = true;
         foreach ($this->channels as $pipe) {
             $pipe->close();
         }
@@ -479,7 +488,7 @@ class Demultiplexer extends Process {
         while (true) {
             $next_chunk = $this->stdin->read();
             if (null === $next_chunk || false === $next_chunk) {
-                break;
+                return;
             }
 
             $metadata = $this->stdin->get_metadata();
@@ -490,16 +499,23 @@ class Demultiplexer extends Process {
             }
 
             $subprocess = $this->subprocesses[$input_channel];
-            $subprocess->stdin->write($next_chunk, $this->stdin->get_metadata());
+            $subprocess->stdin->write($next_chunk, $metadata);
             $subprocess->tick($tick_context);
             $this->last_subprocess = $subprocess;
 
-            $output = $subprocess->stdout->read();
-            if (null !== $output && false !== $output) {
-                $this->stdout->write($output, array_merge(
+            while (true) {
+                $output = $subprocess->stdout->read();
+                if (null === $output || false === $output) {
+                    break;
+                }
+                $chunk_metadata = array_merge(
+                    ['channel' => $input_channel],
                     $subprocess->stdout->get_metadata() ?? [],
-                    ['channel' => $input_channel]
-                ));
+                );
+                $this->stdout->write($output, $chunk_metadata);
+                if($subprocess->stdout->is_channel_eof($chunk_metadata['channel'])) {
+                    $this->stdout->close_channel($chunk_metadata['channel']);
+                }
             }
 
             if (!$subprocess->is_alive()) {
@@ -512,7 +528,6 @@ class Demultiplexer extends Process {
                         ]
                     );
                 }
-                $this->stdout->close_channel($input_channel);
             }
         }
     }
@@ -559,6 +574,9 @@ class ZipReaderProcess extends Process {
                 break;
             }
 
+            $input_metadata = $this->stdin->get_metadata();
+            $input_channel = is_array($input_metadata) && !empty($input_metadata['channel']) ? $input_metadata['channel'] : 'default';
+
             $this->reader->append_bytes($bytes);
             while ($this->reader->next()) {
                 switch ($this->reader->get_state()) {
@@ -569,7 +587,7 @@ class ZipReaderProcess extends Process {
                         }
                         $this->stdout->write($this->reader->get_file_body_chunk(), [
                             'file_id' => $file_path,
-                            'channel' => $file_path,
+                            'channel' => $file_path //$input_channel,
                         ]);
                         break;
                 }
@@ -651,10 +669,14 @@ class ProcessChain extends Process {
     }
 
     protected function do_tick($tick_context) {
-        $data = $this->stdin->read();
-        if (null !== $data && false !== $data) {
+        while(true) {
+            $data = $this->stdin->read();
+            if (null === $data || false === $data) {
+                break;
+            }
             $this->first_subprocess->stdin->write($data, $this->stdin->get_metadata());
         }
+
         if($this->stdin->is_eof()) {
             $this->first_subprocess->stdin->close();
         }
@@ -694,8 +716,11 @@ class ProcessChain extends Process {
             }
         }
 
-        $data = $this->last_subprocess->stdout->read();
-        if(null !== $data && false !== $data) {
+        while (true) {
+            $data = $this->last_subprocess->stdout->read();
+            if (null === $data || false === $data) {
+                break;
+            }
             $this->stdout->write($data, $tick_context);
         }
 
@@ -857,18 +882,18 @@ $process = new ProcessChain([
     HttpClientProcess::stream([
         new Request('http://127.0.0.1:9864/export.wxr.zip'),
         // Bad request, will fail:
-        new Request('http://127.0.0.1:9865'),
+        // new Request('http://127.0.0.1:9865'),
     ]),
 
     'zip' => ZipReaderProcess::stream(),
-    CallbackProcess::stream(function ($data, $context, $process) {
-        if ($context['zip']['file_id'] === 'content.xml') {
-            $context['zip']->skip_file('content.xml');
-            return null;
-        }
-        return $data;
-    }),
-    XMLProcess::stream($rewrite_links_in_wxr_node),
+    // CallbackProcess::stream(function ($data, $context, $process) {
+    //     if ($context['zip']['file_id'] === 'content.xml') {
+    //         $context['zip']->skip_file('content.xml');
+    //         return null;
+    //     }
+    //     return $data;
+    // }),
+    'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
     Uppercaser::stream(),
 ]);
 $process->stdout = new FilePipe('php://stdout', 'w');
@@ -893,15 +918,3 @@ function log_process_chain_errors($process) {
         }
     }    
 }
-
-// $process->tick([]);
-// var_dump($process->stdout->read());
-
-// var_dump($process->stdout->get_metadata());
-// $process->tick([]);
-// var_dump($process->stdout->get_metadata());
-// var_dump($process->stderr->read());
-// $process->tick([]);
-// echo $process->stdout->read();
-// var_dump($process->stdout->is_eof());
-// var_dump($process->is_alive());
