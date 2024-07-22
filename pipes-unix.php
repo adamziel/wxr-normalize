@@ -389,6 +389,7 @@ class MultiChannelPipe implements Pipe {
             $this->channels[$current_channel] = new BufferPipe();
         }
 
+        $this->metadata = $metadata;
         return $this->channels[$current_channel]->write($data, $metadata);
     }
 
