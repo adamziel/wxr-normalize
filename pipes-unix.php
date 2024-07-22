@@ -625,9 +625,7 @@ class TickContext implements ArrayAccess {
 
     public function get_metadata()
     {
-        if(null === $this->data) {
-            $this->data = $this->process->stdout->get_metadata();
-        }
+        $this->data = $this->process->stdout->get_metadata();
         return $this->data;
     }
 
@@ -882,17 +880,17 @@ $process = new ProcessChain([
     HttpClientProcess::stream([
         new Request('http://127.0.0.1:9864/export.wxr.zip'),
         // Bad request, will fail:
-        // new Request('http://127.0.0.1:9865'),
+        new Request('http://127.0.0.1:9865'),
     ]),
 
     'zip' => ZipReaderProcess::stream(),
-    // CallbackProcess::stream(function ($data, $context, $process) {
-    //     if ($context['zip']['file_id'] === 'content.xml') {
-    //         $context['zip']->skip_file('content.xml');
-    //         return null;
-    //     }
-    //     return $data;
-    // }),
+    CallbackProcess::stream(function ($data, $context, $process) {
+        if ($context['zip']['file_id'] === 'export.wxr') {
+            $context['zip']->skip_file('export.wxr');
+            return null;
+        }
+        return $data;
+    }),
     'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
     Uppercaser::stream(),
 ]);
