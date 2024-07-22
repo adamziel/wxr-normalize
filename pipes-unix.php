@@ -11,8 +11,9 @@
  *   whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
  * * Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
  * * Get rid of ProcessManager
- * * Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
- * * Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
+ * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
+ *      Let's keep stderr after all.
+ * * ✅ Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
  * * Explore semantic updates to metadata:
  *   * Exposing metadata on a stream instance instead of a pipe
  *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
@@ -36,6 +37,71 @@
  *   PHP streams where fread() never returns null. Let's think this through some more.
  */
 
+/**
+ * ## Demultiplexing modes: per input channel, per $metadata['file_id'].
+ * 
+ * We want to keep track of:
+ * * Stream ID – the sequential byte stream identifier. Multiple streams will produce
+ *               file chunks in an arbitrary order and, when multiplexed, the chunks will be
+ *               interleaved.
+ * * File ID   – the file within that stream. A single stream may contain multiple files,
+ *               but they will always be written sequentially. When multiplexed, one file will
+ *               always be written completely before the next one is started.
+ * 
+ * When a specific stream errors out, we need to communicate this
+ * downstream and so the consumer processes can handle the error.
+ * 
+ * Therefore, we need a separate pipe for each stream ID. Do we also
+ * need a separate process? Not necessarily. Each process only cares
+ * about the open-ness or EOF-ness of its input and output pipes,
+ * not about the actual lifecycle of the other processes.
+ * 
+ * However, we may want to correlate the same stream ID with stdout and
+ * stderr streams, in which case intertwining stream ID and process ID
+ * would be useful. But then we don't have a 1:1 mapping between
+ * what a data stream does and what a process does.
+ * 
+ * Let's try these two approach and see where we get with it:
+ * 
+ * 1. Each process has a multiplexed stdin, stdout, and stderr pipes.
+ *    We do not use non-multiplexed pipes at all. Every process communicates
+ *    "there will be more output to come" by keeping at least one output
+ *    pipe open. Each process makes sure to react to sub-pipe state changes.
+ *    When a read() operation is called and a specific sub-pipe is EOF, 
+ *    that process cleans up its sub resources and closes the corresponding
+ *    output sub-pipe.
+ * 2. Each process has a single input and output pipe. A process
+ *    that produces multiple data stream fakes spawning one child
+ *    process per data stream. The next process gets multiple input
+ *    pipes, but no actual access to the child processes of the first
+ *    process. Then, it may spawn its own child processes. Hm. But that
+ *    just sounds a multi-pipe solution with extra steps.
+ */
+
+
+/**
+ * ## Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
+ * 
+ * Maybe stderr is fine after all? I'm no longer convinced about inventing a separate mechanism
+ * for error propagation. We'd have to implement a lot of the same features that stderr already
+ * have.
+ * 
+ * Advantages of using stderr for propagating errors:
+ * 
+ * * We can bubble up multiple errors from a single process.
+ * * They have metadata attached and are traceable to a specific process.
+ * * Piping to stderr doesn't imply the entire process have crashed, which we
+ *   wouldn't want in case of, say, Demultiplexer.
+ * * We clearly know when the errors are done, as stderr is a stream and we know
+ *   when it's EOF.
+ * * We can put any pipe in place of stderr, e.g. a generic logger pipe
+ * 
+ * Disadvantages:
+ * 
+ * * Pipes have more features than error propagation uses, e.g. we rarely care
+ *   for is_eof() on stderr, but we still have to close that errors pipe.
+ */
+
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
@@ -49,7 +115,7 @@ class ProcessManager {
         $process = $factory_or_process instanceof Process ? $factory_or_process : $factory_or_process();
         $process->stdin = $stdin ?? new MultiChannelPipe();
         $process->stdout = $stdout ?? new MultiChannelPipe();
-        $process->stderr = $stderr ?? new MultiChannelPipe();
+        $process->stderr = $stderr ?? new BufferPipe();
         $process->pid = self::$last_pid++;
         $process->init();
         self::$process_table[$process->pid] = $process;
@@ -125,33 +191,6 @@ abstract class Process {
         return false;
     }
 
-    protected function set_write_channel(string $name)
-    {
-        $this->stderr->set_channel_for_write($name);
-        $this->stdout->set_channel_for_write($name);
-    }
-
-    protected function ensure_output_channel(string $name)
-    {
-        if(!$this->stderr->has_channel($name)) {
-            $this->stderr->add_channel($name);
-        }
-        if(!$this->stdout->has_channel($name)) {
-            $this->stdout->add_channel($name);
-        }
-    }
-
-    protected function add_output_channel(string $name)
-    {
-        $this->stderr->add_channel($name);
-        $this->stdout->add_channel($name);
-    }
-
-    protected function close_output_channel(string $name)
-    {
-        $this->stderr->close_channel($name);
-        $this->stdout->close_channel($name);
-    }
 }
 
 abstract class TransformProcess extends Process {
@@ -161,17 +200,21 @@ abstract class TransformProcess extends Process {
             return;
         }
 
-        $data = $this->stdin->read();
-        if (null === $data || false === $data) {
-            return;
+        while (true) {
+            $data = $this->stdin->read();
+            if (null === $data || false === $data) {
+                break;
+            }
+            $transformed = $this->transform($data, $tick_context);
+            if (null === $transformed || false === $transformed) {
+                break;
+            }
+            if (!$this->stdout->has_channel($this->stdin->get_current_channel())) {
+                $this->stdout->add_channel($this->stdin->get_current_channel());
+            }
+            $this->stdout->set_write_channel($this->stdin->get_current_channel());
+            $this->stdout->write($transformed, $this->stdin->get_metadata());
         }
-        $transformed = $this->transform($data, $tick_context);
-        if (null === $transformed || false === $transformed) {
-            return;
-        }
-        $this->ensure_output_channel($this->stdin->get_current_channel());
-        $this->set_write_channel($this->stdin->get_current_channel());
-        $this->stdout->write($transformed, $this->stdin->get_metadata());
     }
 
     abstract protected function transform($data, $tick_context);
@@ -302,7 +345,11 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function add_channel(string $name, $pipe = null) {
+        if(isset($this->channels[$name])) {
+            return false;
+        }
         $this->channels[$name] = $pipe ?? new BufferPipe();
+        return true;
     }
 
     public function read() {
@@ -359,15 +406,16 @@ class MultiChannelPipe implements Pipe {
         }
 
         $this->channels[$this->current_channel]->write($data, $metadata);
+        return true;
     }
 
     public function close_channel($channel_name)
     {
-        $this->channels[$channel_name]->close();
         $this->current_channel = null;
+        return $this->channels[$channel_name]->close();
     }
 
-    public function set_channel_for_write($name)
+    public function set_write_channel($name)
     {
         $this->current_channel = $name;
     }
@@ -403,103 +451,6 @@ class MultiChannelPipe implements Pipe {
     }
 }
 
-/**
- * Idea 2: Use multiple child processes for
- * 
- * We want to keep track of:
- * * Stream ID – the sequential byte stream identifier. Multiple streams will produce
- *               file chunks in an arbitrary order and, when multiplexed, the chunks will be
- *               interleaved.
- * * File ID   – the file within that stream. A single stream may contain multiple files,
- *               but they will always be written sequentially. When multiplexed, one file will
- *               always be written completely before the next one is started.
- * 
- * When a specific stream errors out, we need to communicate this
- * downstream and so the consumer processes can handle the error.
- * 
- * Therefore, we need a separate pipe for each stream ID. Do we also
- * need a separate process? Not necessarily. Each process only cares
- * about the open-ness or EOF-ness of its input and output pipes,
- * not about the actual lifecycle of the other processes.
- * 
- * However, we may want to correlate the same stream ID with stdout and
- * stderr streams, in which case intertwining stream ID and process ID
- * would be useful. But then we don't have a 1:1 mapping between
- * what a data stream does and what a process does.
- * 
- * Let's try these two approach and see where we get with it:
- * 
- * 1. Each process has a multiplexed stdin, stdout, and stderr pipes.
- *    We do not use non-multiplexed pipes at all. Every process communicates
- *    "there will be more output to come" by keeping at least one output
- *    pipe open. Each process makes sure to react to sub-pipe state changes.
- *    When a read() operation is called and a specific sub-pipe is EOF, 
- *    that process cleans up its sub resources and closes the corresponding
- *    output sub-pipe.
- * 2. Each process has a single input and output pipe. A process
- *    that produces multiple data stream fakes spawning one child
- *    process per data stream. The next process gets multiple input
- *    pipes, but no actual access to the child processes of the first
- *    process. Then, it may spawn its own child processes. Hm. But that
- *    just sounds a multi-pipe solution with extra steps.
- */
-class FakeHttpClient extends Process
-{
-    protected const SIDE_EFFECTS = true;
-    
-    public function init()
-    {
-        $this->close_output_channel('default');        
-    }
-
-    protected function do_tick($tick_context)
-    {
-        static $tick_nb = 0;
-        if (++$tick_nb === 1) {
-            $this->add_output_channel('stream_1');
-            $this->set_write_channel('stream_1');
-            $this->stdout->write("stream-1-chunk-1", [
-                'file_id' => 1,
-            ]);
-
-            $this->add_output_channel('stream_2');
-            $this->set_write_channel('stream_2');
-            $this->stdout->write("stream-2-chunk-1!", [
-                'file_id' => 2,
-            ]);
-        } else if (++$tick_nb === 2) {
-            $this->set_write_channel('stream_3');
-            $this->stdout->write("stream-3-chunk-1!");
-        } else {
-            $this->set_write_channel('stream_1');
-            $this->stdout->write("stream-1-chunk-2", [
-                'file_id' => 1,
-            ]);
-            $this->stdout->write("stream-1-chunk-3", [
-                'file_id' => 3,
-            ]);
-
-            $this->add_output_channel('stream_3');
-            $this->set_write_channel('stream_3');
-            $this->stdout->write("stream-3-chunk-2!", [
-                'file_id' => 2,
-            ]);
-
-            $this->kill(0);
-        }
-    }
-}
-
-
-class HelloWorld extends Process {
-    protected function do_tick($tick_context) {
-        $this->stdout->write("Hello, world!", [
-            'file_id' => 1,
-        ]);
-        $this->stderr->write("Critical error has occured :(");
-        $this->kill(1);
-    }
-}
 
 class Uppercaser extends TransformProcess {
     static public function stream() {
@@ -542,38 +493,43 @@ class Demultiplexer extends Process {
             return;
         }
 
-        $next_chunk = $this->stdin->read();
-        if(null === $next_chunk || false === $next_chunk) {
-            return;
-        }
-
-        $input_channel = $this->stdin->get_current_channel();
-        if(!isset($this->subprocesses[$input_channel])) {
-            $this->add_output_channel($input_channel);
-            $this->subprocesses[$input_channel] = ProcessManager::spawn(
-                $this->process_factory
-            );
-        }
-
-        $subprocess = $this->subprocesses[$input_channel];
-        $subprocess->stdin->write( $next_chunk, $this->stdin->get_metadata() );
-        $subprocess->tick($tick_context);
-        $this->last_subprocess = $subprocess;
-
-        $output = $subprocess->stdout->read();
-        if(null !== $output && false !== $output) {
-            $this->set_write_channel($input_channel);
-            $this->stdout->write($output, $subprocess->stdout->get_metadata());
-        }
-
-        if (!$subprocess->is_alive()) {
-            if($subprocess->has_crashed()) {
-                $this->stderr->write("Subprocess $input_channel has crashed with code {$subprocess->exit_code}", [
-                    'type' => 'crash',
-                    'process' => $subprocess,
-                ]);
+        while (true) {
+            $next_chunk = $this->stdin->read();
+            if (null === $next_chunk || false === $next_chunk) {
+                break;
             }
-            $this->close_output_channel($input_channel);
+
+            $input_channel = $this->stdin->get_current_channel();
+            if (!isset($this->subprocesses[$input_channel])) {
+                $this->stdout->add_channel($input_channel);
+                $this->subprocesses[$input_channel] = ProcessManager::spawn(
+                    $this->process_factory
+                );
+            }
+
+            $subprocess = $this->subprocesses[$input_channel];
+            $subprocess->stdin->write($next_chunk, $this->stdin->get_metadata());
+            $subprocess->tick($tick_context);
+            $this->last_subprocess = $subprocess;
+
+            $output = $subprocess->stdout->read();
+            if (null !== $output && false !== $output) {
+                $this->stdout->set_write_channel($input_channel);
+                $this->stdout->write($output, $subprocess->stdout->get_metadata());
+            }
+
+            if (!$subprocess->is_alive()) {
+                if ($subprocess->has_crashed()) {
+                    $this->stderr->write(
+                        "Subprocess $input_channel has crashed with code {$subprocess->exit_code}",
+                        [
+                            'type' => 'crash',
+                            'process' => $subprocess,
+                        ]
+                    );
+                }
+                $this->stdout->close_channel($input_channel);
+            }
         }
     }
 
@@ -612,25 +568,29 @@ class ZipReaderProcess extends Process {
             return;
         }
 
-        $bytes = $this->stdin->read();
-        if(null === $bytes || false === $bytes) {
-            return;
-        }
+        while (true) {
+            $bytes = $this->stdin->read();
+            if (null === $bytes || false === $bytes) {
+                break;
+            }
 
-        $this->reader->append_bytes($bytes);
-        while ($this->reader->next()) {
-            switch($this->reader->get_state()) {
-                case ZipStreamReader::STATE_FILE_ENTRY:
-                    $file_path = $this->reader->get_file_path();
-                    if($this->last_skipped_file === $file_path) {
+            $this->reader->append_bytes($bytes);
+            while ($this->reader->next()) {
+                switch ($this->reader->get_state()) {
+                    case ZipStreamReader::STATE_FILE_ENTRY:
+                        $file_path = $this->reader->get_file_path();
+                        if ($this->last_skipped_file === $file_path) {
+                            break;
+                        }
+                        if (!$this->stdout->has_channel($file_path)) {
+                            $this->stdout->add_channel($file_path);
+                        }
+                        $this->stdout->set_write_channel($file_path);
+                        $this->stdout->write($this->reader->get_file_body_chunk(), [
+                            'file_id' => $file_path
+                        ]);
                         break;
-                    }
-                    $this->ensure_output_channel($file_path);
-                    $this->set_write_channel($file_path);
-                    $this->stdout->write($this->reader->get_file_body_chunk(), [
-                        'file_id' => $file_path
-                    ]);
-                    break;
+                }
             }
         }
     }
@@ -701,9 +661,7 @@ class ProcessChain extends Process {
             $factory = $processes[$i];
             $subprocess = ProcessManager::spawn(
                 $factory, 
-                null !== $last_process ?$last_process->stdout : null,
-                null,
-                $this->stderr
+                null !== $last_process ?$last_process->stdout : null
             );
             $this->subprocesses[$names[$i]] = $subprocess;
             $last_process = $subprocess;
@@ -741,6 +699,19 @@ class ProcessChain extends Process {
                     ]);
                     return;
                 }
+                continue;
+            }
+
+            while (true) {
+                $err = $process->stderr->read();
+                if (null === $err || false === $err) {
+                    break;
+                }
+                $this->stderr->write($err, [
+                    'type' => 'error',
+                    'process' => $process,
+                    ...$process->stderr->get_metadata(),
+                ]);
             }
         }
 
@@ -775,32 +746,31 @@ class HttpClientProcess extends Process {
     protected function do_tick($tick_context)
     {
 		if ( ! $this->client->await_next_event() ) {
-            var_dump('nope');
             $this->kill(0);
 			return false;
 		}
 
 		$request = $this->client->get_request();
         $output_channel = 'request_' . $request->id;
-        $this->ensure_output_channel($output_channel);
-
-        var_dump($this->client->get_event());
+        if (!$this->stdout->has_channel($output_channel)) {
+            $this->stdout->add_channel($output_channel);
+        }
+        $this->stdout->set_write_channel($output_channel);
 
 		switch ( $this->client->get_event() ) {
 			case Client::EVENT_BODY_CHUNK_AVAILABLE:
-				$this->set_write_channel($output_channel);
                 $this->stdout->write($this->client->get_response_body_chunk(), [
                     'request' => $request
                 ]);
 				break;
-			case Client::EVENT_FAILED:
+            case Client::EVENT_FAILED:
                 $this->stderr->write('Request failed: ' . $request->error, [
                     'request' => $request
                 ]);
-                $this->close_output_channel($output_channel);
+                $this->stdout->close_channel($output_channel);
 				break;
 			case Client::EVENT_FINISHED:
-                $this->close_output_channel($output_channel);
+                $this->stdout->close_channel($output_channel);
                 break;
 		}
 	}
@@ -900,6 +870,8 @@ $process = ProcessManager::spawn(
     new ProcessChain([
         HttpClientProcess::stream([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
+            // Bad request, will fail:
+            new Request('http://127.0.0.1:9865'),
         ]),
 
         'zip' => ZipReaderProcess::stream(),
@@ -912,12 +884,17 @@ $process = ProcessManager::spawn(
         }),
         XMLProcess::stream($rewrite_links_in_wxr_node),
         Uppercaser::stream(),
-    ])
+    ]),
 );
 $process->stdout = new FilePipe('php://stdout', 'w');
+$process->stderr = new FilePipe('php://stderr', 'w');
 $process->run();
 
 function log_process_chain_errors($process) {
+    if(!($process->stderr instanceof BufferPipe)) {
+        return;
+    }
+    
     $error = $process->stderr->read();
     if ($error) {
         echo 'Error: ' . $error . "\n";
