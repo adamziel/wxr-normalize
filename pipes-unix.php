@@ -124,6 +124,8 @@ abstract class TransformProcess extends Process {
         if (null === $transformed || false === $transformed) {
             return;
         }
+        $this->ensure_output_channel($this->stdin->get_current_channel());
+        $this->set_write_channel($this->stdin->get_current_channel());
         $this->stdout->write($transformed, $this->stdin->get_metadata());
     }
 
@@ -822,9 +824,6 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 require __DIR__ . '/bootstrap.php';
 
 
-
-
-
 $process = ProcessManager::spawn(
     fn() => new ProcessChain([
         'http' => fn() => new HttpClientProcess([
@@ -838,9 +837,8 @@ $process = ProcessManager::spawn(
             }
             return $data;
         }),
-        // 'xml' => fn() => new XMLProcess($rewrite_links_in_wxr_node),
-        // 'uc' => fn() => new Uppercaser(),
-        'xml' => fn() => new Demultiplexer(fn() => new XMLProcess($rewrite_links_in_wxr_node))
+        'xml' => fn() => new Demultiplexer(fn() => new XMLProcess($rewrite_links_in_wxr_node)),
+        'uc' => fn() => new Uppercaser(),
     ])
 );
 // $process->stdin = new BufferPipe('<item><content:encoded>hello, world</content:encoded></item>');
