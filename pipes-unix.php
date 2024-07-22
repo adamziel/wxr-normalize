@@ -1,5 +1,8 @@
 <?php
 
+use WordPress\AsyncHttp\Client;
+use WordPress\AsyncHttp\Request;
+
 class ProcessManager {
 
     static private $last_pid = 1;
@@ -40,12 +43,12 @@ abstract class Process {
     public Pipe $stderr;
     public $pid;
 
-    public function tick($tick_context) {
+    public function tick($tick_context=null) {
         if(!$this->is_alive()) {
             return;
         }
 
-        return $this->do_tick($tick_context);
+        return $this->do_tick($tick_context ?? []);
     }
 
     abstract protected function do_tick($tick_context);
@@ -72,10 +75,25 @@ abstract class Process {
         // clean up resources
     }
 
+    public function skip_file($file_id) {
+        // Needs to be implemented by subclasses
+        return false;
+    }
+
     protected function set_write_channel(string $name)
     {
         $this->stderr->set_channel_for_write($name);
         $this->stdout->set_channel_for_write($name);
+    }
+
+    protected function ensure_output_channel(string $name)
+    {
+        if(!$this->stderr->has_channel($name)) {
+            $this->stderr->add_channel($name);
+        }
+        if(!$this->stdout->has_channel($name)) {
+            $this->stdout->add_channel($name);
+        }
     }
 
     protected function add_output_channel(string $name)
@@ -102,7 +120,11 @@ abstract class TransformProcess extends Process {
         if (null === $data || false === $data) {
             return;
         }
-        $this->stdout->write($this->transform($data, $tick_context));
+        $transformed = $this->transform($data, $tick_context);
+        if (null === $transformed || false === $transformed) {
+            return;
+        }
+        $this->stdout->write($transformed, $this->stdin->get_metadata());
     }
 
     abstract protected function transform($data, $tick_context);
@@ -117,10 +139,15 @@ interface Pipe {
     public function get_metadata();
 }
 
-class BufferingPipe implements Pipe {
+class BufferPipe implements Pipe {
     public ?string $buffer = null;
     public $metadata = null;
     private bool $closed = false;
+
+    public function __construct($buffer = null)
+    {
+        $this->buffer = $buffer;        
+    }
 
     public function read() {
         $buffer = $this->buffer;
@@ -228,7 +255,7 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function add_channel(string $name, $pipe = null) {
-        $this->channels[$name] = $pipe ?? new BufferingPipe();
+        $this->channels[$name] = $pipe ?? new BufferPipe();
     }
 
     public function read() {
@@ -433,10 +460,23 @@ class Uppercaser extends TransformProcess {
     }
 }
 
+class CallbackProcess extends TransformProcess {
+    private $callback;
+    public function __construct($callback) {
+        $this->callback = $callback;
+    }
+
+    protected function transform($data, $tick_context) {
+        $callback = $this->callback;
+        return $callback($data, $tick_context, $this);
+    }
+}
+
 class Demultiplexer extends Process {
     private $process_factory = [];
     public $subprocesses = [];
     private $killed_subprocesses = [];
+    private $last_subprocess = [];
     public function __construct($process_factory) {
         $this->process_factory = $process_factory;
     }
@@ -463,6 +503,7 @@ class Demultiplexer extends Process {
         $subprocess = $this->subprocesses[$input_channel];
         $subprocess->stdin->write( $next_chunk, $this->stdin->get_metadata() );
         $subprocess->tick($tick_context);
+        $this->last_subprocess = $subprocess;
 
         $output = $subprocess->stdout->read();
         if(null !== $output && false !== $output) {
@@ -480,8 +521,103 @@ class Demultiplexer extends Process {
             $this->close_output_channel($input_channel);
         }
     }
+
+    public function skip_file($file_id)
+    {
+        if(!$this->last_subprocess) {
+            return false;
+        }
+        return $this->last_subprocess->skip_file($file_id);
+    }
 }
 
+require __DIR__ . '/zip-stream-reader.php';
+
+class ZipReaderProcess extends Process {
+
+    private $reader;
+    private $last_skipped_file = null;
+
+    public function init() {
+        $this->reader = new ZipStreamReader('');
+    }
+
+    public function skip_file($file_id)
+    {
+        $this->last_skipped_file = $file_id;
+    }
+
+    protected function do_tick($tick_context) {
+        if($this->stdin->is_eof()) {
+            $this->kill(0);
+            return;
+        }
+
+        $bytes = $this->stdin->read();
+        if(null === $bytes || false === $bytes) {
+            return;
+        }
+
+        $this->reader->append_bytes($bytes);
+        while ($this->reader->next()) {
+            switch($this->reader->get_state()) {
+                case ZipStreamReader::STATE_FILE_ENTRY:
+                    $file_path = $this->reader->get_file_path();
+                    if($this->last_skipped_file === $file_path) {
+                        break;
+                    }
+                    $this->ensure_output_channel($file_path);
+                    $this->set_write_channel($file_path);
+                    $this->stdout->write($this->reader->get_file_body_chunk(), [
+                        'file_id' => $file_path
+                    ]);
+                    break;
+            }
+        }
+    }
+}
+
+class TickContext implements ArrayAccess {
+    private $data;
+    private $process;
+
+    public function offsetExists($offset): bool {
+        $this->get_metadata();
+        return isset($this->data[$offset]);
+    }
+
+    public function offsetGet($offset): mixed {
+        $this->get_metadata();
+        return $this->data[$offset] ?? null;
+    }
+
+    public function offsetSet($offset, $value): void {
+        $this->data[$offset] = $value;
+    }
+
+    public function offsetUnset($offset): void {
+        unset($this->data[$offset]);
+    }
+
+    public function __construct($process)
+    {
+        $this->process = $process;
+    }
+
+    public function get_metadata()
+    {
+        if(null === $this->data) {
+            $this->data = $this->process->stdout->get_metadata();
+        }
+        return $this->data;
+    }
+
+    public function skip_file($file_id)
+    {
+        return $this->process->skip_file($file_id);        
+    }
+
+}
 
 class ProcessChain extends Process {
     public array $process_factories;
@@ -528,10 +664,7 @@ class ProcessChain extends Process {
             }
 
             if(!$process->stdout->is_eof()) {
-                $metadata = $process->stdout->get_metadata();
-                if (null !== $metadata) {
-                    $tick_context[$name] = $metadata;
-                }
+                $tick_context[$name] = new TickContext($process);
             }
 
             if($process->has_crashed()) {
@@ -558,25 +691,169 @@ class ProcessChain extends Process {
     }
 }
 
+
+class HttpClientProcess extends Process {
+	private $client;
+	private $requests = [];
+	private $child_contexts = [];
+	private $skipped_requests = [];
+	private $errors = [];
+
+	public function __construct( $requests ) {
+		$this->client = new Client();
+		$this->client->enqueue( $requests );
+	}
+
+    protected function do_tick($tick_context)
+    {
+		if ( ! $this->client->await_next_event() ) {
+            var_dump('nope');
+            $this->kill(0);
+			return false;
+		}
+
+		$request = $this->client->get_request();
+        $output_channel = 'request_' . $request->id;
+        $this->ensure_output_channel($output_channel);
+
+        var_dump($this->client->get_event());
+
+		switch ( $this->client->get_event() ) {
+			case Client::EVENT_BODY_CHUNK_AVAILABLE:
+				$this->set_write_channel($output_channel);
+                $this->stdout->write($this->client->get_response_body_chunk(), [
+                    'request' => $request
+                ]);
+				break;
+			case Client::EVENT_FAILED:
+                $this->stderr->write('Request failed: ' . $request->error, [
+                    'request' => $request
+                ]);
+                $this->close_output_channel($output_channel);
+				break;
+			case Client::EVENT_FINISHED:
+                $this->close_output_channel($output_channel);
+                break;
+		}
+	}
+
+}
+
+
+class XMLProcess extends TransformProcess {
+	private $xml_processor;
+	private $node_visitor_callback;
+
+	public function __construct( $node_visitor_callback ) {
+		$this->xml_processor         = new WP_XML_Processor( '', [], WP_XML_Processor::IN_PROLOG_CONTEXT );
+		$this->node_visitor_callback = $node_visitor_callback;
+	}
+
+    protected function transform($data, $tick_context)
+    {
+		$processor = $this->xml_processor;
+		if ( $processor->get_last_error() ) {
+            $this->kill(1);
+			$this->stderr->write( $processor->get_last_error() );
+			return false;
+		}
+
+        $processor->stream_append_xml( $data );
+
+		$tokens_found = 0;
+		while ( $processor->next_token() ) {
+			++ $tokens_found;
+			$node_visitor_callback = $this->node_visitor_callback;
+			$node_visitor_callback( $processor );
+		}
+
+        $buffer = '';
+		if ( $tokens_found > 0 ) {
+			$buffer .= $processor->get_updated_xml();
+		} else if ( $tokens_found === 0 || ! $processor->paused_at_incomplete_token() ) {
+			$buffer .= $processor->get_unprocessed_xml();
+		}
+
+        return $buffer;
+	}
+
+}
+
+
+function is_wxr_content_node( WP_XML_Processor $processor ) {
+	if ( ! in_array( 'item', $processor->get_breadcrumbs() ) ) {
+		return false;
+	}
+	if (
+		! in_array( 'excerpt:encoded', $processor->get_breadcrumbs() )
+		&& ! in_array( 'content:encoded', $processor->get_breadcrumbs() )
+		&& ! in_array( 'wp:attachment_url', $processor->get_breadcrumbs() )
+		&& ! in_array( 'guid', $processor->get_breadcrumbs() )
+		&& ! in_array( 'link', $processor->get_breadcrumbs() )
+		&& ! in_array( 'wp:comment_content', $processor->get_breadcrumbs() )
+		// Meta values are not suppoerted yet. We'll need to support
+		// WordPress core options that may be saved as JSON, PHP Deserialization, and XML,
+		// and then provide extension points for plugins authors support
+		// their own options.
+		// !in_array('wp:postmeta', $processor->get_breadcrumbs())
+	) {
+		return false;
+	}
+
+	switch ( $processor->get_token_type() ) {
+		case '#text':
+		case '#cdata-section':
+			return true;
+	}
+
+	return false;
+};
+
+$rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
+	if (is_wxr_content_node($processor)) {
+		$text = $processor->get_modifiable_text();
+		$updated_text = 'Hey there, what\'s up?';
+		if ($updated_text !== $text) {
+			$processor->set_modifiable_text($updated_text);
+		}
+	}
+};
+
+require __DIR__ . '/bootstrap.php';
+
+
+
+
+
 $process = ProcessManager::spawn(
-    fn () => new ProcessChain([
-        // 'http' => fn() => new FakeHttpClient(),
-        'uc' => fn() => new Uppercaser(),
-        // 'upper' => fn() => new Demultiplexer(fn() => new Uppercaser())
+    fn() => new ProcessChain([
+        'http' => fn() => new HttpClientProcess([
+            new Request('http://127.0.0.1:9864/export.wxr.zip'),
+        ]),
+        'zip' => fn() => new ZipReaderProcess(),
+        'skip' => fn() => new CallbackProcess(function ($data, $context, $process) {
+            if($context['zip']['file_id'] === 'content.xml') {
+                $context['zip']->skip_file('content.xml');
+                return null;
+            }
+            return $data;
+        }),
+        // 'xml' => fn() => new XMLProcess($rewrite_links_in_wxr_node),
+        // 'uc' => fn() => new Uppercaser(),
+        'xml' => fn() => new Demultiplexer(fn() => new XMLProcess($rewrite_links_in_wxr_node))
     ])
 );
-$process->stdin = new FilePipe('./file', 'r');
+// $process->stdin = new BufferPipe('<item><content:encoded>hello, world</content:encoded></item>');
+// $process->stdin = new FilePipe('./test.zip', 'r');
 $process->stdout = new FilePipe('php://stdout', 'w');
 
 $i = 0;
 do {
-    $process->tick([]);
+    $process->tick();
+    log_process_chain_errors($process);
+} while ($process->is_alive());
 
-    // $data = $process->stdout->read();
-    // if(is_string($data)) {
-    //     echo 'Data: ' . $data . "\n";
-    // }
-
+function log_process_chain_errors($process) {
     $error = $process->stderr->read();
     if ($error) {
         echo 'Error: ' . $error . "\n";
@@ -587,8 +864,8 @@ do {
                 echo 'CRASH: ' . $meta['process']->stderr->read() . "\n";
             }
         }
-    }
-} while ($process->is_alive());
+    }    
+}
 
 // $process->tick([]);
 // var_dump($process->stdout->read());
