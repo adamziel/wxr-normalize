@@ -9,8 +9,8 @@ class ProcessManager {
     static private $process_table = [];
     static private $reaped_pids = [];
 
-    static public function spawn($factory, $stdin=null, $stdout=null, $stderr=null) {
-        $process = $factory();
+    static public function spawn($factory_or_process, $stdin=null, $stdout=null, $stderr=null) {
+        $process = $factory_or_process instanceof Process ? $factory_or_process : $factory_or_process();
         $process->stdin = $stdin ?? new MultiChannelPipe();
         $process->stdout = $stdout ?? new MultiChannelPipe();
         $process->stderr = $stderr ?? new MultiChannelPipe();
@@ -852,7 +852,7 @@ require __DIR__ . '/bootstrap.php';
 
 
 $process = ProcessManager::spawn(
-    fn() => new ProcessChain([
+    new ProcessChain([
         HttpClientProcess::stream([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
         ]),
