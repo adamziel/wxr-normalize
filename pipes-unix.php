@@ -114,9 +114,10 @@ interface Pipe {
     public function write(string $data, $metadata=null);
     public function is_eof();
     public function close();
+    public function get_metadata();
 }
 
-class UnixPipe implements Pipe {
+class BufferingPipe implements Pipe {
     public ?string $buffer = null;
     public $metadata = null;
     private bool $closed = false;
@@ -154,6 +155,64 @@ class UnixPipe implements Pipe {
     }
 }
 
+class ResourcePipe implements Pipe {
+    public $resource;
+    private bool $closed = false;
+
+    public function __construct($resource) {
+        $this->resource = $resource;
+    }
+
+    public function read() {
+        if($this->closed) {
+            return false;
+        }
+        $data = fread($this->resource, 1024);
+        if(false === $data) {
+            $this->close();
+            return false;
+        }
+
+        if('' === $data) {
+            if(feof($this->resource)) {
+                $this->close();
+            }
+            return null;
+        }
+
+        return $data;
+    }
+
+    public function write(string $data, $metadata=null) {
+        if($this->closed) {
+            return false;
+        }
+        fwrite($this->resource, $data);
+    }
+
+    public function get_metadata() {
+        return null;
+    }
+
+    public function is_eof() {
+        return $this->closed;        
+    }
+
+    public function close() {
+        if($this->closed) {
+            return;
+        }
+        fclose($this->resource);
+        $this->closed = true;
+    }
+}
+
+class FilePipe extends ResourcePipe {
+    public function __construct($filename, $mode) {
+        parent::__construct(fopen($filename, $mode));
+    }
+}
+
 /**
  * Idea 1: Use multiple pipes to pass multi-band I/O data between processes.
  */
@@ -169,7 +228,7 @@ class MultiChannelPipe implements Pipe {
     }
 
     public function add_channel(string $name, $pipe = null) {
-        $this->channels[$name] = $pipe ?? new UnixPipe();
+        $this->channels[$name] = $pipe ?? new BufferingPipe();
     }
 
     public function read() {
@@ -424,8 +483,10 @@ class Demultiplexer extends Process {
 }
 
 
-class ShellCommandsChain extends Process {
+class ProcessChain extends Process {
     public array $process_factories;
+    private $first_subprocess;
+    private $last_subprocess;
     public $subprocesses = [];
     private $reaped_pids = [];
 
@@ -438,23 +499,29 @@ class ShellCommandsChain extends Process {
         $names = array_keys($this->process_factories);
         $processes = array_values($this->process_factories);
         for($i = 0; $i < count($this->process_factories); $i++) {
-            if(null === $last_process) {
-                $stdin = $this->stdin;
-            } else {
-                $stdin = $last_process->stdout;
-            }
             $subprocess = ProcessManager::spawn(
                 $processes[$i], 
-                $stdin,
+                null !== $last_process ?$last_process->stdout : null,
                 null,
                 $this->stderr
             );
             $this->subprocesses[$names[$i]] = $subprocess;
             $last_process = $subprocess;
         }
+
+        $this->first_subprocess = $this->subprocesses[$names[0]];
+        $this->last_subprocess = $this->subprocesses[$names[count($this->process_factories) - 1]];
     }
 
     protected function do_tick($tick_context) {
+        $data = $this->stdin->read();
+        if (null !== $data && false !== $data) {
+            $this->first_subprocess->stdin->write($data, $this->stdin->get_metadata());
+        }
+        if($this->stdin->is_eof()) {
+            $this->first_subprocess->stdin->close();
+        }
+
         foreach ($this->subprocesses as $name => $process) {
             if ($process->is_alive()) {
                 $process->tick($tick_context);
@@ -480,32 +547,35 @@ class ShellCommandsChain extends Process {
             }
         }
 
-        $data = $process->stdout->read();
+        $data = $this->last_subprocess->stdout->read();
         if(null !== $data && false !== $data) {
             $this->stdout->write($data, $tick_context);
         }
 
-        if($process->stdout->is_eof()) {
+        if($this->last_subprocess->stdout->is_eof()) {
             $this->kill(0);
         }
     }
 }
 
-$process = ProcessManager::spawn(fn () => new ShellCommandsChain([
-    'http' => fn() => new FakeHttpClient(),
-    'uc' => fn() => new Uppercaser(),
-    // 'upper' => fn() => new Demultiplexer(fn() => new Uppercaser())
-]));
+$process = ProcessManager::spawn(
+    fn () => new ProcessChain([
+        // 'http' => fn() => new FakeHttpClient(),
+        'uc' => fn() => new Uppercaser(),
+        // 'upper' => fn() => new Demultiplexer(fn() => new Uppercaser())
+    ])
+);
+$process->stdin = new FilePipe('./file', 'r');
+$process->stdout = new FilePipe('php://stdout', 'w');
 
 $i = 0;
-
 do {
     $process->tick([]);
 
-    $data = $process->stdout->read();
-    if(is_string($data)) {
-        echo 'Data: ' . $data . "\n";
-    }
+    // $data = $process->stdout->read();
+    // if(is_string($data)) {
+    //     echo 'Data: ' . $data . "\n";
+    // }
 
     $error = $process->stderr->read();
     if ($error) {
