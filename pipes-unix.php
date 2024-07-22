@@ -457,6 +457,9 @@ class HelloWorld extends Process {
 }
 
 class Uppercaser extends TransformProcess {
+    static public function stream() {
+        return fn() => new static();
+    }
     protected function transform($data, $tick_context) {
         return strtoupper($data);
     }
@@ -464,7 +467,12 @@ class Uppercaser extends TransformProcess {
 
 class CallbackProcess extends TransformProcess {
     private $callback;
-    public function __construct($callback) {
+    
+    static public function stream($callback) {
+        return fn () => new CallbackProcess($callback);
+    }
+
+    private function __construct($callback) {
         $this->callback = $callback;
     }
 
@@ -539,6 +547,10 @@ class ZipReaderProcess extends Process {
 
     private $reader;
     private $last_skipped_file = null;
+
+    static public function stream() {
+        return fn () => new Demultiplexer(fn() => new ZipReaderProcess());
+    }
 
     public function init() {
         $this->reader = new ZipStreamReader('');
@@ -635,10 +647,15 @@ class ProcessChain extends Process {
     public function init() {
         $last_process = null;
         $names = array_keys($this->process_factories);
+        foreach($names as $k => $name) {
+            $names[$k] = $name . '';
+        }
+
         $processes = array_values($this->process_factories);
         for($i = 0; $i < count($this->process_factories); $i++) {
+            $factory = $processes[$i];
             $subprocess = ProcessManager::spawn(
-                $processes[$i], 
+                $factory, 
                 null !== $last_process ?$last_process->stdout : null,
                 null,
                 $this->stderr
@@ -701,7 +718,11 @@ class HttpClientProcess extends Process {
 	private $skipped_requests = [];
 	private $errors = [];
 
-	public function __construct( $requests ) {
+    static public function stream($requests) {
+        return fn () => new HttpClientProcess($requests);
+    }
+
+	private function __construct( $requests ) {
 		$this->client = new Client();
 		$this->client->enqueue( $requests );
 	}
@@ -746,7 +767,13 @@ class XMLProcess extends TransformProcess {
 	private $xml_processor;
 	private $node_visitor_callback;
 
-	public function __construct( $node_visitor_callback ) {
+    static public function stream($node_visitor_callback) {
+        return fn () => new Demultiplexer(fn () =>
+            new XMLProcess($node_visitor_callback)
+        );
+    }
+
+	private function __construct( $node_visitor_callback ) {
 		$this->xml_processor         = new WP_XML_Processor( '', [], WP_XML_Processor::IN_PROLOG_CONTEXT );
 		$this->node_visitor_callback = $node_visitor_callback;
 	}
@@ -826,23 +853,22 @@ require __DIR__ . '/bootstrap.php';
 
 $process = ProcessManager::spawn(
     fn() => new ProcessChain([
-        'http' => fn() => new HttpClientProcess([
+        HttpClientProcess::stream([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
         ]),
-        'zip' => fn() => new ZipReaderProcess(),
-        'skip' => fn() => new CallbackProcess(function ($data, $context, $process) {
+
+        'zip' => ZipReaderProcess::stream(),
+        CallbackProcess::stream(function ($data, $context, $process) {
             if($context['zip']['file_id'] === 'content.xml') {
                 $context['zip']->skip_file('content.xml');
                 return null;
             }
             return $data;
         }),
-        'xml' => fn() => new Demultiplexer(fn() => new XMLProcess($rewrite_links_in_wxr_node)),
-        'uc' => fn() => new Uppercaser(),
+        XMLProcess::stream($rewrite_links_in_wxr_node),
+        Uppercaser::stream(),
     ])
 );
-// $process->stdin = new BufferPipe('<item><content:encoded>hello, world</content:encoded></item>');
-// $process->stdin = new FilePipe('./test.zip', 'r');
 $process->stdout = new FilePipe('php://stdout', 'w');
 
 $i = 0;
