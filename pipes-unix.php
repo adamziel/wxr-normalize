@@ -27,6 +27,9 @@
  *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
  *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
  *   And it would keep track of eofs etc using a set of internal Pipe instances?
+ *   ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
+ *     to keep multiple buffers around. The only remaining advantage of a MultiChannelPipe
+ *     is tracking EOF for each channel separately.
  * * Calling get_metadata() without calling read() first returns the last metadata. This
  *   bit me a few times when I was in a context where I could not call read() first because,
  *   e.g. another process was about to do that. Maybe this is a good thing, as it forces us
