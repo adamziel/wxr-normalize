@@ -2,7 +2,36 @@
 
 /**
  * @TODO:
- * 
+ *
+ * * Explore semantic updates to metadata:
+ *   * Exposing metadata on a stream instance instead of a pipe.
+ *     ^ With the new "execution stack" model, this seems like a great approach.
+ *       $context['zip'] wouldn't be an abstract metadata array, but the actual ZipStreamReader instance
+ *       with all the methods and properties available.
+ *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
+ *     ^ the problem with this is that methods like `skip_file()` affect the currently processed file and we
+ *       must call them at the right time
+ * * Demultiplexing modes: per "sequence_id" (e.g. ZIPping a sequence of files), per "file_id" 
+ *   (e.g. XML rewriting each file separately, regardless of the chunks order)
+ * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
+ *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
+ *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
+ *   And it would keep track of eofs etc using a set of internal Pipe instances?
+ *   ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
+ *     to keep multiple buffers around. The only remaining advantage of a MultiChannelPipe
+ *     is tracking EOF for each channel separately.
+ *   ^ Do we need separate "pipes" at all?
+ *     * The process chain semantics assumes every output chunk will be fully processed
+ *       before the next one is produced.
+ *     * Writing to a pipe before consuming its contents is an undefiend behavior similarly
+ *       as with processes.
+ *     * "pipes" are buffers and "processes" are buffers.
+ *     * I can close a single channel in a pipe without closing the entire pipe or the next
+ *       process.
+ *     * A separate Pipe class encapsulates the writing and consumption logic. It wouldn't be
+ *       handy to force that on every process.
+ *     * But still, could we have a ProcessPipe class? And a PipeProcess class?
+ *
  * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
  *   I only used it to make the development easier, I got confused with the other attempt in
  *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
@@ -22,23 +51,6 @@
  * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
  *      Let's keep stderr after all.
  * * ✅ Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
- * * Explore semantic updates to metadata:
- *   * Exposing metadata on a stream instance instead of a pipe.
- *     ^ With the new "execution stack" model, this seems like a great approach.
- *       $context['zip'] wouldn't be an abstract metadata array, but the actual ZipStreamReader instance
- *       with all the methods and properties available.
- *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
- *     ^ the problem with this is that methods like `skip_file()` affect the currently processed file and we
- *       must call them at the right time
- * * Demultiplexing modes: per "sequence_id" (e.g. ZIPping a sequence of files), per "file_id" 
- *   (e.g. XML rewriting each file separately, regardless of the chunks order)
- * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
- *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
- *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
- *   And it would keep track of eofs etc using a set of internal Pipe instances?
- *   ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
- *     to keep multiple buffers around. The only remaining advantage of a MultiChannelPipe
- *     is tracking EOF for each channel separately.
  * * ✅ Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
  *      but let's still add it for a moment just to make sure we're not missing any typed return.
  * * ✅ Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
@@ -868,14 +880,12 @@ class ProcessChain extends Process {
 
     private function handle_errors($process)
     {
-        if(!$process->has_crashed()) {
-            while ($process->stderr->read()) {
-                $this->stderr->write($process->stderr->consume_bytes(), [
-                    'type' => 'error',
-                    'process' => $process,
-                    ...($process->stderr->get_metadata() ?? []),
-                ]);
-            }
+        while ($process->stderr->read()) {
+            $this->stderr->write($process->stderr->consume_bytes(), [
+                'type' => 'error',
+                'process' => $process,
+                ...($process->stderr->get_metadata() ?? []),
+            ]);
         }
 
         if($process->has_crashed()) {
