@@ -15,8 +15,13 @@
  *      Let's keep stderr after all.
  * * ✅ Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
  * * Explore semantic updates to metadata:
- *   * Exposing metadata on a stream instance instead of a pipe
+ *   * Exposing metadata on a stream instance instead of a pipe.
+ *     ^ With the new "execution stack" model, this seems like a great approach.
+ *       $context['zip'] wouldn't be an abstract metadata array, but the actual ZipStreamReader instance
+ *       with all the methods and properties available.
  *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
+ *     ^ the problem with this is that methods like `skip_file()` affect the currently processed file and we
+ *       must call them at the right time
  * * Demultiplexing modes: per input channel, per $metadata['file_id'].
  * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
  *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
@@ -30,7 +35,9 @@
  *   do processing, ant only then write to A.1 stdin. Still, a better error reporting wouldn't hurt.
  * * Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
  *   but let's still add it for a moment just to make sure we're not missing any typed return.
- * * Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
+ * * ✅ Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
+ *      It now returns either "true", which means "I've produced output", or "false", which means
+ *      "I haven't produced output".
  * * Pipe::read() returns a string on success, false on failure, or null if there were no writes
  *   since the last read and we'd just return an empty string. This three-state semantics is useful,
  *   but it's painful to always check for false and null, and then it may not interop well with
@@ -123,14 +130,12 @@ abstract class Process {
     {
         do {
             $this->tick();
-            // @TODO: Implement error handling
-            log_process_chain_errors($this);
         } while ($this->is_alive());
     }
 
     public function tick($tick_context=null) {
         if(!$this->is_alive()) {
-            return;
+            return false;
         }
 
         return $this->do_tick($tick_context ?? []);
@@ -183,20 +188,21 @@ abstract class TransformProcess extends Process {
     protected function do_tick($tick_context) {
         if($this->stdin->is_eof()) {
             $this->kill(0);
-            return;
+            return false;
         }
 
-        while (true) {
-            $data = $this->stdin->read();
-            if (null === $data || false === $data) {
-                break;
-            }
-            $transformed = $this->transform($data, $tick_context);
-            if (null === $transformed || false === $transformed) {
-                break;
-            }
-            $this->stdout->write($transformed, $this->stdin->get_metadata());
+        $data = $this->stdin->read();
+        if (null === $data || false === $data) {
+            return false;
         }
+
+        $transformed = $this->transform($data, $tick_context);
+        if (null === $transformed || false === $transformed) {
+            return false;
+        }
+
+        $this->stdout->write($transformed, $this->stdin->get_metadata());
+        return true;
     }
 
     abstract protected function transform($data, $tick_context);
@@ -474,63 +480,82 @@ class Demultiplexer extends Process {
     private $process_factory = [];
     public $subprocesses = [];
     private $killed_subprocesses = [];
-    private $last_subprocess = [];
+    private $demux_queue = [];
+    private $last_subprocess;
+    private $last_input_channel;
+    
     public function __construct($process_factory) {
         $this->process_factory = $process_factory;
         parent::__construct();
     }
 
     protected function do_tick($tick_context) {
-        if($this->stdin->is_eof()) {
+        if(true === $this->tick_last_subprocess()) {
+            return true;
+        }
+
+        if($this->stdin->is_eof() || $this->stdout->is_eof()) {
             $this->kill(0);
-            return;
+            return false;
         }
 
-        while (true) {
-            $next_chunk = $this->stdin->read();
-            if (null === $next_chunk || false === $next_chunk) {
-                return;
+        $next_chunk = $this->stdin->read();
+        if (null === $next_chunk || false === $next_chunk) {
+            return false;
+        }
+
+        $metadata = $this->stdin->get_metadata();
+        $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
+        $this->last_input_channel = $input_channel;
+        if (!isset($this->subprocesses[$input_channel])) {
+            $factory = $this->process_factory;
+            $this->subprocesses[$input_channel] = $factory();
+        }
+
+        $subprocess = $this->subprocesses[$input_channel];
+        $subprocess->stdin->write($next_chunk, $metadata);
+        $this->last_subprocess = $subprocess;
+
+        return $this->tick_last_subprocess();
+    }
+
+    private function tick_last_subprocess()
+    {
+        $subprocess = $this->last_subprocess;
+        if(!$subprocess) {
+            return false;
+        }
+
+        if(false === $subprocess->tick()) {
+            return false;
+        }
+    
+        $output = $subprocess->stdout->read();
+        if (null !== $output && false !== $output) {
+            $chunk_metadata = array_merge(
+                ['channel' => $this->last_input_channel],
+                $subprocess->stdout->get_metadata() ?? [],
+            );
+            $this->stdout->write($output, $chunk_metadata);
+            if ($subprocess->stdout->is_channel_eof($chunk_metadata['channel'])) {
+                $this->stdout->close_channel($chunk_metadata['channel']);
             }
+            return true;
+        }
 
-            $metadata = $this->stdin->get_metadata();
-            $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
-            if (!isset($this->subprocesses[$input_channel])) {
-                $factory = $this->process_factory;
-                $this->subprocesses[$input_channel] = $factory();
-            }
-
-            $subprocess = $this->subprocesses[$input_channel];
-            $subprocess->stdin->write($next_chunk, $metadata);
-            $subprocess->tick($tick_context);
-            $this->last_subprocess = $subprocess;
-
-            while (true) {
-                $output = $subprocess->stdout->read();
-                if (null === $output || false === $output) {
-                    break;
-                }
-                $chunk_metadata = array_merge(
-                    ['channel' => $input_channel],
-                    $subprocess->stdout->get_metadata() ?? [],
+        if (!$subprocess->is_alive()) {
+            if ($subprocess->has_crashed()) {
+                $this->stderr->write(
+                    "Subprocess $this->last_input_channel has crashed with code {$subprocess->exit_code}",
+                    [
+                        'type' => 'crash',
+                        'process' => $subprocess,
+                    ]
                 );
-                $this->stdout->write($output, $chunk_metadata);
-                if($subprocess->stdout->is_channel_eof($chunk_metadata['channel'])) {
-                    $this->stdout->close_channel($chunk_metadata['channel']);
-                }
-            }
-
-            if (!$subprocess->is_alive()) {
-                if ($subprocess->has_crashed()) {
-                    $this->stderr->write(
-                        "Subprocess $input_channel has crashed with code {$subprocess->exit_code}",
-                        [
-                            'type' => 'crash',
-                            'process' => $subprocess,
-                        ]
-                    );
-                }
             }
         }
+
+        return false;
     }
 
     public function skip_file($file_id)
@@ -564,56 +589,62 @@ class ZipReaderProcess extends Process {
     }
 
     protected function do_tick($tick_context) {
+        if(true === $this->process_buffered_data()) {
+            return true;
+        }
+
         if($this->stdin->is_eof()) {
             $this->kill(0);
-            return;
+            return false;
         }
 
-        while (true) {
-            $bytes = $this->stdin->read();
-            if (null === $bytes || false === $bytes) {
-                break;
-            }
+        $bytes = $this->stdin->read();
+        if (null === $bytes || false === $bytes) {
+            return false;
+        }
 
-            $input_metadata = $this->stdin->get_metadata();
-            $input_channel = is_array($input_metadata) && !empty($input_metadata['channel']) ? $input_metadata['channel'] : 'default';
+        $this->reader->append_bytes($bytes);
+        return $this->process_buffered_data();
+    }
 
-            $this->reader->append_bytes($bytes);
-            while ($this->reader->next()) {
-                switch ($this->reader->get_state()) {
-                    case ZipStreamReader::STATE_FILE_ENTRY:
-                        $file_path = $this->reader->get_file_path();
-                        if ($this->last_skipped_file === $file_path) {
-                            break;
-                        }
-                        $this->stdout->write($this->reader->get_file_body_chunk(), [
-                            'file_id' => $file_path,
-                            // We don't want any single chunk to contain mixed bytes from
-                            // multiple files.
-                            // 
-                            // Therefore, we must either:
-                            // 
-                            // * Use a separate channel for each file to have distinct
-                            //   buckets that don't mix.
-                            // * Use a single channel and ensure the unzipped file is fully
-                            //   written and consumed before we start writing the next file.
-                            // 
-                            // The second option requires more implementation complexity and also
-                            // requires checking whether the output pipe has been read completely
-                            // which is very specific to a BufferPipe. The first option seems simpler
-                            // so let's go with that.
-                            'channel' => $file_path,
-                        ]);
-                        break;
-                }
+    protected function process_buffered_data()
+    {
+        while ($this->reader->next()) {
+            switch ($this->reader->get_state()) {
+                case ZipStreamReader::STATE_FILE_ENTRY:
+                    $file_path = $this->reader->get_file_path();
+                    if ($this->last_skipped_file === $file_path) {
+                        // break;
+                    }
+                    $this->stdout->write($this->reader->get_file_body_chunk(), [
+                        'file_id' => $file_path,
+                        // We don't want any single chunk to contain mixed bytes from
+                        // multiple files.
+                        // 
+                        // Therefore, we must either:
+                        // 
+                        // * Use a separate channel for each file to have distinct
+                        //   buckets that don't mix.
+                        // * Use a single channel and ensure the unzipped file is fully
+                        //   written and consumed before we start writing the next file.
+                        // 
+                        // The second option requires more implementation complexity and also
+                        // requires checking whether the output pipe has been read completely
+                        // which is very specific to a BufferPipe. The first option seems simpler
+                        // so let's go with that.
+                        'channel' => $file_path,
+                    ]);
+                    return true;
             }
         }
+
+        return false;        
     }
 }
 
 class TickContext implements ArrayAccess {
     private $data;
-    private $process;
+    public $process;
 
     public function offsetExists($offset): bool {
         $this->get_metadata();
@@ -655,15 +686,18 @@ class ProcessChain extends Process {
     private $first_subprocess;
     private $last_subprocess;
     public $subprocesses = [];
+    public $subprocesses_names = [];
     private $reaped_pids = [];
+    private $execution_stack = [];
+    private $tick_context = [];
 
     public function __construct($process_factories) {
         parent::__construct();
 
         $last_process = null;
-        $names = array_keys($process_factories);
-        foreach($names as $k => $name) {
-            $names[$k] = $name . '';
+        $this->subprocesses_names = array_keys($process_factories);
+        foreach($this->subprocesses_names as $k => $name) {
+            $this->subprocesses_names[$k] = $name . '';
         }
 
         $processes = array_values($process_factories);
@@ -673,15 +707,44 @@ class ProcessChain extends Process {
             if(null !== $last_process) {
                 $subprocess->stdin = $last_process->stdout;
             }
-            $this->subprocesses[$names[$i]] = $subprocess;
+            $this->subprocesses[$this->subprocesses_names[$i]] = $subprocess;
             $last_process = $subprocess;
         }
 
-        $this->first_subprocess = $this->subprocesses[$names[0]];
-        $this->last_subprocess = $this->subprocesses[$names[count($process_factories) - 1]];
+        $this->first_subprocess = $this->subprocesses[$this->subprocesses_names[0]];
+        $this->last_subprocess = $this->subprocesses[$this->subprocesses_names[count($process_factories) - 1]];
     }
 
+    /**
+     * ## Process chain tick
+     * 
+     * Pushes data through a chain of subprocesses. Every downstream data chunk
+     * is fully processed before asking for more chunks upstream.
+     * 
+     * For example, suppose we:
+     * 
+     * * Send 3 HTTP requests, and each of them produces a ZIP file
+     * * Each ZIP file has 3 XML files inside
+     * * Each XML file is rewritten using the XML_Processor
+     * 
+     * Once the HTTP client has produced the first ZIP file, we start processing it.
+     * The ZIP decoder may already have enough data to unzip three files, but we only
+     * produce the first chunk of the first file and pass it to the XML processor.
+     * Then we handle the second chunk of the first file, and so on, until the first
+     * file is fully processed. Only then we move to the second file.
+     * 
+     * Then, once the ZIP decoder exhausted the data for the first ZIP file, we move
+     * to the second ZIP file, and so on.
+     * 
+     * This way we can maintain a predictable $context variable that carries upstream
+     * metadata and exposes methods like skip_file().
+     */
     protected function do_tick($tick_context) {
+        if($this->last_subprocess->stdout->is_eof()) {
+            $this->kill(0);
+            return false;
+        }
+
         while(true) {
             $data = $this->stdin->read();
             if (null === $data || false === $data) {
@@ -694,28 +757,78 @@ class ProcessChain extends Process {
             $this->first_subprocess->stdin->close();
         }
 
-        foreach ($this->subprocesses as $name => $process) {
-            if ($process->is_alive()) {
-                $process->tick($tick_context);
-            }
+        if(empty($this->execution_stack)) {
+            array_push($this->execution_stack, $this->first_subprocess);
+        }
 
-            if(!$process->stdout->is_eof()) {
-                $tick_context[$name] = new TickContext($process);
-            }
-
-            if($process->has_crashed()) {
-                if (!$process->is_reaped()) {
-                    $process->reap();
-                    $this->stderr->write("Process $name has crashed with code {$process->exit_code}", [
-                        'type' => 'crash',
-                        'process' => $process,
-                        'reaped' => true,
-                    ]);
-                    return;
-                }
+        while (count($this->execution_stack)) {
+            // Unpeel the context stack until we find a process that
+            // produces output.
+            $process = $this->pop_process();
+            if ($process->stdout->is_eof()) {
                 continue;
             }
 
+            if(true !== $this->tick_subprocess($process)) {
+                continue;
+            }
+
+            // We've got output from the process, yay! Let's
+            // propagate it downstream.
+            $this->push_process($process);
+
+            for ($i = count($this->execution_stack); $i < count($this->subprocesses_names); $i++) {
+                $next_process = $this->subprocesses[$this->subprocesses_names[$i]];
+                if (true !== $this->tick_subprocess($next_process)) {
+                    break;
+                }
+                $this->push_process($next_process);
+            }
+
+            // When the last process in the chain produces output,
+            // we write it to the stdout pipe and bale.
+            $data = $this->last_subprocess->stdout->read();
+            if (null === $data || false === $data) {
+                break;
+            }
+
+            $this->stdout->write($data, $this->tick_context);
+            return true;
+        }
+
+        // We produced no output and the upstream pipe is EOF.
+        // We're done.
+        if(!$this->first_subprocess->is_alive()) {
+            $this->kill(0);
+        }
+
+        return false;
+    }
+
+    private function pop_process()
+    {
+        $name = $this->subprocesses_names[count($this->execution_stack) - 1];
+        unset($this->tick_context[$name]);
+        return array_pop($this->execution_stack);        
+    }
+
+    private function push_process($process)
+    {
+        array_push($this->execution_stack, $process);
+        $name = $this->subprocesses_names[count($this->execution_stack) - 1];
+        $this->tick_context[$name] = new TickContext($process);        
+    }
+
+    private function tick_subprocess($process)
+    {
+        $produced_output = $process->tick($this->tick_context);
+        $this->handle_errors($process);
+        return $produced_output;        
+    }
+
+    private function handle_errors($process)
+    {
+        if(!$process->has_crashed()) {
             while (true) {
                 $err = $process->stderr->read();
                 if (null === $err || false === $err) {
@@ -729,16 +842,16 @@ class ProcessChain extends Process {
             }
         }
 
-        while (true) {
-            $data = $this->last_subprocess->stdout->read();
-            if (null === $data || false === $data) {
-                break;
+        if($process->has_crashed()) {
+            if (!$process->is_reaped()) {
+                $process->reap();
+                $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
+                $this->stderr->write("Process $name has crashed with code {$process->exit_code}", [
+                    'type' => 'crash',
+                    'process' => $process,
+                    'reaped' => true,
+                ]);
             }
-            $this->stdout->write($data, $tick_context);
-        }
-
-        if($this->last_subprocess->stdout->is_eof()) {
-            $this->kill(0);
         }
     }
 }
@@ -773,36 +886,38 @@ class HttpClientProcess extends Process {
 
     protected function do_tick($tick_context)
     {
-		if ( ! $this->client->await_next_event() ) {
-            $this->kill(0);
-			return false;
-		}
+        while($this->client->await_next_event()) {
+            $request = $this->client->get_request();
+            $output_channel = 'request_' . $request->id;
+            switch ($this->client->get_event()) {
+                case Client::EVENT_BODY_CHUNK_AVAILABLE:
+                    $this->stdout->write($this->client->get_response_body_chunk(), [
+                        'channel' => $output_channel,
+                        'request' => $request
+                    ]);
+                    return true;
 
-		$request = $this->client->get_request();
-        $output_channel = 'request_' . $request->id;
-		switch ( $this->client->get_event() ) {
-			case Client::EVENT_BODY_CHUNK_AVAILABLE:
-                $this->stdout->write($this->client->get_response_body_chunk(), [
-                    'channel' => $output_channel,
-                    'request' => $request
-                ]);
-				break;
-            case Client::EVENT_FAILED:
-                $this->stderr->write('Request failed: ' . $request->error, [
-                    'request' => $request
-                ]);
-                $this->stdout->close_channel($output_channel);
-				break;
-			case Client::EVENT_FINISHED:
-                $this->stdout->close_channel($output_channel);
-                break;
-		}
+                case Client::EVENT_FAILED:
+                    $this->stderr->write('Request failed: ' . $request->error, [
+                        'request' => $request
+                    ]);
+                    $this->stdout->close_channel($output_channel);
+                    break;
+
+                case Client::EVENT_FINISHED:
+                    $this->stdout->close_channel($output_channel);
+                    break;
+            }
+        }
+
+        $this->kill(0);
+        return false;
 	}
 
 }
 
 
-class XMLProcess extends TransformProcess {
+class XMLProcess extends Process {
 	private $xml_processor;
 	private $node_visitor_callback;
 
@@ -818,34 +933,65 @@ class XMLProcess extends TransformProcess {
         parent::__construct();
 	}
 
-    protected function transform($data, $tick_context)
+    protected function do_tick($tick_context) {
+        if(true === $this->process_buffered_data()) {
+            return true;
+        }
+
+        if($this->stdin->is_eof()) {
+            $this->kill(0);
+            return false;
+        }
+
+        $bytes = $this->stdin->read();
+        if (null === $bytes || false === $bytes) {
+            return false;
+        }
+
+        $this->xml_processor->stream_append_xml($bytes);
+        return $this->process_buffered_data();
+    }
+
+    private function process_buffered_data()
     {
-		$processor = $this->xml_processor;
-		if ( $processor->get_last_error() ) {
+        if($this->xml_processor->paused_at_incomplete_token()) {
+            return false;
+        }
+
+		if ( $this->xml_processor->get_last_error() ) {
             $this->kill(1);
-			$this->stderr->write( $processor->get_last_error() );
+			$this->stderr->write( $this->xml_processor->get_last_error() );
 			return false;
 		}
 
-        $processor->stream_append_xml( $data );
-
-		$tokens_found = 0;
-		while ( $processor->next_token() ) {
+        $tokens_found = 0;
+		while ( $this->xml_processor->next_token() ) {
 			++ $tokens_found;
 			$node_visitor_callback = $this->node_visitor_callback;
-			$node_visitor_callback( $processor );
+			$node_visitor_callback( $this->xml_processor );
 		}
 
         $buffer = '';
 		if ( $tokens_found > 0 ) {
-			$buffer .= $processor->get_updated_xml();
-		} else if ( $tokens_found === 0 || ! $processor->paused_at_incomplete_token() ) {
-			$buffer .= $processor->get_unprocessed_xml();
+			$buffer .= $this->xml_processor->get_updated_xml();
+		} else if ( 
+            $tokens_found === 0 && 
+            ! $this->xml_processor->paused_at_incomplete_token() &&
+            $this->xml_processor->get_current_depth() === 0
+        ) {
+            // We've reached the end of the document, let's finish up.
+			$buffer .= $this->xml_processor->get_unprocessed_xml();
+            $this->kill(0);
 		}
 
-        return $buffer;
-	}
+        if(!strlen($buffer)) {
+            return false;
+        }
 
+        $this->stdout->write($buffer);
+
+        return true;
+    }
 }
 
 
