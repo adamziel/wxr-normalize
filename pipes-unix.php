@@ -6,6 +6,11 @@
  * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
  *   I only used it to make the development easier, I got confused with the other attempt in
  *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
+ * * ✅ Explore merging Pipes and Processes into a single concept after all.
+ *      Not doing that is nice, too. Writing to stdout is not equivalent to
+ *      starting more computation downstream. Reading from stdin is not equivalent
+ *      to trigerring more computations upstream. We get a buffer, a demilitarized
+ *      zone between processes. Perhaps that's what was missing from the other experiment.
  * * ✅ Make ProcessChain implement the Iterator interface. Iterator semantics doesn't make
  *      as much sense on regular process classes because they may run out of input and they
  *      can't pull more bytes from the top of the stream.
