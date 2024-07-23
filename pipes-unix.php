@@ -3,42 +3,49 @@
 /**
  * @TODO:
  *
- * * Explore semantic updates to metadata:
+ * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
+ *   I only used it to make the development easier, I got confused with the other attempt in
+ *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
+ * * ✅ Make ProcessChain implement the Iterator interface. Iterator semantics doesn't make
+ *      as much sense on regular process classes because they may run out of input and they
+ *      can't pull more bytes from the top of the stream.
+ * * ✅ Explore changes updates to metadata:
  *   * Exposing metadata on a stream instance instead of a pipe.
  *     ^ With the new "execution stack" model, this seems like a great approach.
  *       $context['zip'] wouldn't be an abstract metadata array, but the actual ZipStreamReader instance
  *       with all the methods and properties available.
+ *     ^ Problem is, we want the next stream to have access to the metadata.
+ *     ^ Well, writing metadata to stdout is the same as coupling it with the stream instance.
+ *       Also, since we'll need to access the metadata later, even after it's been written to the next
+ *       stream, we may need to keep the Pipe class around.
  *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
  *     ^ the problem with this is that methods like `skip_file()` affect the currently processed file and we
  *       must call them at the right time
- * * Demultiplexing modes: per "sequence_id" (e.g. ZIPping a sequence of files), per "file_id" 
- *   (e.g. XML rewriting each file separately, regardless of the chunks order)
- * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
- *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
- *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
- *   And it would keep track of eofs etc using a set of internal Pipe instances?
- *   ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
- *     to keep multiple buffers around. The only remaining advantage of a MultiChannelPipe
- *     is tracking EOF for each channel separately.
- *   ^ Do we need separate "pipes" at all?
- *     * The process chain semantics assumes every output chunk will be fully processed
- *       before the next one is produced.
- *     * Writing to a pipe before consuming its contents is an undefiend behavior similarly
- *       as with processes.
- *     * "pipes" are buffers and "processes" are buffers.
- *     * I can close a single channel in a pipe without closing the entire pipe or the next
- *       process.
- *     * A separate Pipe class encapsulates the writing and consumption logic. It wouldn't be
- *       handy to force that on every process.
- *     * But still, could we have a ProcessPipe class? And a PipeProcess class?
- *     * Every Process needs a way to receive more data, emit its data, and emit errors.
- *       Currently we assume a tick() call that does $stdin->read(). We could have a public
- *       Process::write() method 
- *
- * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
- *   I only used it to make the development easier, I got confused with the other attempt in
- *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
- * * Make Process implement the Iterator interface
+ * * ✅ Demultiplexing modes: per "sequence_id" (e.g. ZIPping a sequence of files), per "file_id" 
+ *      (e.g. XML rewriting each file separately, regardless of the chunks order)
+ *      ^ $key constructor argument handles that now
+ * * ✅ Figure out interop Pipe and MultiplexedPipe – they are not interchangeable. Maybe
+ *     we could use metadata to pass the sequence name, and the regular pipe would ignore it?
+ *     Maybe a MultiplexedPipe would just have special semantics for that metadata field?
+ *     And it would keep track of eofs etc using a set of internal Pipe instances?
+ *     ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
+ *       to keep multiple buffers around. The only remaining advantage of a MultiplexedPipe
+ *       is tracking EOF for each sequence separately.
+ *     ^ Do we need separate "pipes" at all?
+ *       * The process chain semantics assumes every output chunk will be fully processed
+ *         before the next one is produced.
+ *       * Writing to a pipe before consuming its contents is an undefiend behavior similarly
+ *         as with processes.
+ *       * "pipes" are buffers and "processes" are buffers.
+ *       * I can close a single sequence in a pipe without closing the entire pipe or the next
+ *         process.
+ *       * A separate Pipe class encapsulates the writing and consumption logic. It wouldn't be
+ *         handy to force that on every process.
+ *       * But still, could we have a ProcessPipe class? And a PipeProcess class?
+ *       * Every Process needs a way to receive more data, emit its data, and emit errors.
+ *         Currently we assume a tick() call that does $stdin->read(). We could have a public
+ *         Process::write() method 
+ *    ^ MultiplexedPipe isn't used anymore
  * * ✅ The process `do_tick` method typically checks for `stdin->is_eof()` and then
  *      whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
  *      ^ the BufferProcessor interface solves that problem.
@@ -53,7 +60,7 @@
  * * ✅ Get rid of ProcessManager
  * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
  *      Let's keep stderr after all.
- * * ✅ Remove these methods: set_write_channel, ensure_output_channel, add_output_channel, close_output_channel
+ * * ✅ Remove these methods: set_write_sequence, ensure_output_sequence, add_output_sequence, close_output_sequence
  * * ✅ Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
  *      but let's still add it for a moment just to make sure we're not missing any typed return.
  * * ✅ Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
@@ -77,15 +84,15 @@
  */
 
 /**
- * ## Demultiplexing modes: per input channel, per $metadata['file_id'].
+ * ## Demultiplexing modes: per input sequence, per $metadata['file_id'].
  * 
  * We want to keep track of:
- * * Stream ID – the sequential byte stream identifier. Multiple streams will produce
- *               file chunks in an arbitrary order and, when multiplexed, the chunks will be
- *               interleaved.
- * * File ID   – the file within that stream. A single stream may contain multiple files,
- *               but they will always be written sequentially. When multiplexed, one file will
- *               always be written completely before the next one is started.
+ * * Sequence ID – the sequential byte stream identifier. Multiple streams will produce
+ *                 file chunks in an arbitrary order and, when multiplexed, the chunks will be
+ *                 interleaved.
+ * * File ID     – the file within that stream. A single stream may contain multiple files,
+ *                 but they will always be written sequentially. When multiplexed, one file will
+ *                 always be written completely before the next one is started.
  * 
  * When a specific stream errors out, we need to communicate this
  * downstream and so the consumer processes can handle the error.
@@ -403,25 +410,25 @@ class FilePipe extends ResourcePipe {
  */
 class MultiplexingPipe implements Pipe {
     private $used = false;
-    private array $channels = [];
-    private ?string $last_read_channel = 'default';
+    private array $sequences = [];
+    private ?string $last_read_sequence = 'default';
 
     public function __construct(array $pipes = [])
     {
-        $this->channels = $pipes;
+        $this->sequences = $pipes;
     }
 
     public function read(): ?bool {
-        if (empty($this->channels)) {
+        if (empty($this->sequences)) {
             return false;
         }
 
-        $channels_to_check = $this->next_channels();
-        foreach($channels_to_check as $channel_name) {
-            if(!$this->channels[$channel_name]->read()) {
+        $sequences_to_check = $this->next_sequences();
+        foreach($sequences_to_check as $sequence_name) {
+            if(!$this->sequences[$sequence_name]->read()) {
                 continue;
             }
-            $this->last_read_channel = $channel_name;
+            $this->last_read_sequence = $sequence_name;
             return true;
         }
 
@@ -430,64 +437,64 @@ class MultiplexingPipe implements Pipe {
 
     public function consume_bytes()
     {
-        if(!$this->last_read_channel || !isset($this->channels[$this->last_read_channel])) {
+        if(!$this->last_read_sequence || !isset($this->sequences[$this->last_read_sequence])) {
             return null;
         }
-        return $this->channels[$this->last_read_channel]->consume_bytes();
+        return $this->sequences[$this->last_read_sequence]->consume_bytes();
     }
 
     public function get_metadata() {
-        if(!$this->last_read_channel || !isset($this->channels[$this->last_read_channel])) {
+        if(!$this->last_read_sequence || !isset($this->sequences[$this->last_read_sequence])) {
             return null;
         }
-        return $this->channels[$this->last_read_channel]->get_metadata();
+        return $this->sequences[$this->last_read_sequence]->get_metadata();
     }
 
-    private function next_channels() {
-        $channels_queue = [];
-        $channel_names = array_keys($this->channels);
-        $last_read_channel_index = array_search($this->last_read_channel, $channel_names);
-        if(false === $last_read_channel_index) {
-            $last_read_channel_index = 0;
-        } else if($last_read_channel_index > count($channel_names)) {
-            $last_read_channel_index = count($channel_names) - 1;
+    private function next_sequences() {
+        $sequences_queue = [];
+        $sequence_names = array_keys($this->sequences);
+        $last_read_sequence_index = array_search($this->last_read_sequence, $sequence_names);
+        if(false === $last_read_sequence_index) {
+            $last_read_sequence_index = 0;
+        } else if($last_read_sequence_index > count($sequence_names)) {
+            $last_read_sequence_index = count($sequence_names) - 1;
         }
 
-        $this->last_read_channel = null;
-        for ($i = 1; $i <= count($channel_names); $i++) {
-            $key_index = ($last_read_channel_index + $i) % count($channel_names);
-            $channel_name = $channel_names[$key_index];
-            if($this->channels[$channel_name]->is_eof()) {
-                unset($this->channels[$channel_name]);
+        $this->last_read_sequence = null;
+        for ($i = 1; $i <= count($sequence_names); $i++) {
+            $key_index = ($last_read_sequence_index + $i) % count($sequence_names);
+            $sequence_name = $sequence_names[$key_index];
+            if($this->sequences[$sequence_name]->is_eof()) {
+                unset($this->sequences[$sequence_name]);
                 continue;
             }
-            $this->last_read_channel = $channel_name;
-            $channels_queue[] = $channel_name;
+            $this->last_read_sequence = $sequence_name;
+            $sequences_queue[] = $sequence_name;
         }
-        return $channels_queue;
+        return $sequences_queue;
     }
 
     public function write(string $data, $metadata = null): bool {
         $this->used = true;
-        $current_channel = 'default';
+        $current_sequence = 'default';
 
-        if(is_array($metadata) && isset($metadata['channel'])) {
-            $current_channel = $metadata['channel'];
+        if(is_array($metadata) && isset($metadata['sequence'])) {
+            $current_sequence = $metadata['sequence'];
         }
 
-        if (!isset($this->channels[$current_channel])) {
-            $this->channels[$current_channel] = new BufferPipe();
+        if (!isset($this->sequences[$current_sequence])) {
+            $this->sequences[$current_sequence] = new BufferPipe();
         }
 
-        $this->last_read_channel = $current_channel;
-        return $this->channels[$current_channel]->write($data, $metadata);
+        $this->last_read_sequence = $current_sequence;
+        return $this->sequences[$current_sequence]->write($data, $metadata);
     }
 
     public function is_eof(): bool {
         if(!$this->used) {
             return false;
         }
-        foreach ($this->channels as $pipe) {
+        foreach ($this->sequences as $pipe) {
             if (!$pipe->is_eof()) {
                 return false;
             }
@@ -497,7 +504,7 @@ class MultiplexingPipe implements Pipe {
 
     public function close() {
         $this->used = true;
-        foreach ($this->channels as $pipe) {
+        foreach ($this->sequences as $pipe) {
             $pipe->close();
         }
     }
@@ -537,22 +544,24 @@ class Demultiplexer extends BufferProcessor {
     private $killed_subprocesses = [];
     private $demux_queue = [];
     private $last_subprocess;
-    private $last_input_channel;
+    private $last_input_key;
+    private $key;
     
-    public function __construct($process_factory) {
+    public function __construct($process_factory, $key = 'sequence') {
         $this->process_factory = $process_factory;
+        $this->key = $key;
         parent::__construct();
     }
 
     protected function write($next_chunk, $metadata) {
-        $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
-        $this->last_input_channel = $input_channel;
-        if (!isset($this->subprocesses[$input_channel])) {
+        $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
+        $this->last_input_key = $chunk_key;
+        if (!isset($this->subprocesses[$chunk_key])) {
             $factory = $this->process_factory;
-            $this->subprocesses[$input_channel] = $factory();
+            $this->subprocesses[$chunk_key] = $factory();
         }
 
-        $subprocess = $this->subprocesses[$input_channel];
+        $subprocess = $this->subprocesses[$chunk_key];
         $subprocess->stdin->write($next_chunk, $metadata);
         $this->last_subprocess = $subprocess;
     }
@@ -571,7 +580,7 @@ class Demultiplexer extends BufferProcessor {
         if ($subprocess->stdout->read()) {
             $output = $subprocess->stdout->consume_bytes();
             $chunk_metadata = array_merge(
-                ['channel' => $this->last_input_channel],
+                [$this->key => $this->last_input_key],
                 $subprocess->stdout->get_metadata() ?? [],
             );
             $this->stdout->write($output, $chunk_metadata);
@@ -581,7 +590,7 @@ class Demultiplexer extends BufferProcessor {
         if (!$subprocess->is_alive()) {
             if ($subprocess->has_crashed()) {
                 $this->stderr->write(
-                    "Subprocess $this->last_input_channel has crashed with code {$subprocess->exit_code}",
+                    "Subprocess $this->last_input_key has crashed with code {$subprocess->exit_code}",
                     [
                         'type' => 'crash',
                         'process' => $subprocess,
@@ -638,9 +647,9 @@ class ZipReaderProcess extends BufferProcessor {
                     }
                     $this->stdout->write($this->reader->get_file_body_chunk(), [
                         'file_id' => $file_path,
-                        // Use a separate channel for each file so the next
+                        // Use a separate sequence for each file so the next
                         // process may separate the files.
-                        'channel' => $file_path,
+                        'sequence' => $file_path,
                     ]);
                     return true;
             }
@@ -690,7 +699,7 @@ class TickContext implements ArrayAccess {
 
 }
 
-class ProcessChain extends Process {
+class ProcessChain extends Process implements Iterator {
     private $first_subprocess;
     private $last_subprocess;
     public $subprocesses = [];
@@ -804,6 +813,7 @@ class ProcessChain extends Process {
                 $this->last_subprocess->stdout->consume_bytes(),
                 $this->tick_context
             );
+            ++$this->chunk_nb;
             return true;
         }
 
@@ -859,6 +869,42 @@ class ProcessChain extends Process {
             }
         }
     }
+
+    // Iterator methods. These don't make much sense on a regular
+    // process class because they cannot pull more input chunks from
+    // the top of the stream like ProcessChain can.
+
+    private $iterator_output_cache;
+    private $chunk_nb = -1;
+	public function current(): mixed {
+		if(null === $this->iterator_output_cache) {
+			$this->iterator_output_cache = $this->stdout->consume_bytes();
+		}
+		return $this->iterator_output_cache;
+	}
+
+	public function key(): mixed {
+		return $this->chunk_nb;
+	}
+
+	public function rewind(): void {
+		$this->next();
+	}
+
+	public function next(): void {
+		$this->iterator_output_cache = null;
+		while(!$this->tick()) {
+            if(!$this->is_alive()) {
+                break;
+            }
+			usleep(10000);
+		}
+	}
+
+	public function valid(): bool {
+		return $this->is_alive();
+	}
+
 }
 
 
@@ -884,11 +930,11 @@ class HttpClientProcess extends Process {
     {
         while($this->client->await_next_event()) {
             $request = $this->client->get_request();
-            $output_channel = 'request_' . $request->id;
+            $output_sequence = 'request_' . $request->id;
             switch ($this->client->get_event()) {
                 case Client::EVENT_BODY_CHUNK_AVAILABLE:
                     $this->stdout->write($this->client->get_response_body_chunk(), [
-                        'channel' => $output_channel,
+                        'sequence' => $output_sequence,
                         'request' => $request
                     ]);
                     return true;
@@ -1022,19 +1068,21 @@ $process = new ProcessChain([
     ]),
 
     'zip' => ZipReaderProcess::stream(),
-    // CallbackProcess::stream(function ($data, $context, $process) {
-    //     if ($context['zip']['file_id'] === 'export.wxr') {
-    //         $context['zip']->skip_file('export.wxr');
-    //         return null;
-    //     }
-    //     return $data;
-    // }),
+    CallbackProcess::stream(function ($data, $context, $process) {
+        if ($context['zip']['file_id'] === 'export.wxr') {
+            $context['zip']->skip_file('export.wxr');
+            return null;
+        }
+        return $data;
+    }),
     'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
     Uppercaser::stream(),
 ]);
-$process->stdout = new FilePipe('php://stdout', 'w');
+// $process->stdout = new FilePipe('php://stdout', 'w');
 $process->stderr = new FilePipe('php://stderr', 'w');
-$process->run();
+foreach($process as $k => $chunk) {
+    var_dump([$k => $chunk]);
+}
 
 function log_process_chain_errors($process) {
     return;
