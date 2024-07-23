@@ -31,6 +31,9 @@
  *     * A separate Pipe class encapsulates the writing and consumption logic. It wouldn't be
  *       handy to force that on every process.
  *     * But still, could we have a ProcessPipe class? And a PipeProcess class?
+ *     * Every Process needs a way to receive more data, emit its data, and emit errors.
+ *       Currently we assume a tick() call that does $stdin->read(). We could have a public
+ *       Process::write() method 
  *
  * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
  *   I only used it to make the development easier, I got confused with the other attempt in
@@ -150,8 +153,8 @@ abstract class Process {
 
     public function __construct($stdin=null, $stdout=null, $stderr=null)
     {
-        $this->stdin = $stdin ?? new MultiChannelPipe();
-        $this->stdout = $stdout ?? new MultiChannelPipe();
+        $this->stdin = $stdin ?? new BufferPipe();
+        $this->stdout = $stdout ?? new BufferPipe();
         $this->stderr = $stderr ?? new BufferPipe();
     }
 
@@ -395,12 +398,18 @@ class FilePipe extends ResourcePipe {
 }
 
 /**
- * Idea 1: Use multiple pipes to pass multi-band I/O data between processes.
+ * This isn't used anymore. Yay! It could be just removed,
+ * but it looks useful so let's keep it around for a while.
  */
-class MultiChannelPipe implements Pipe {
+class MultiplexingPipe implements Pipe {
     private $used = false;
     private array $channels = [];
     private ?string $last_read_channel = 'default';
+
+    public function __construct(array $pipes = [])
+    {
+        $this->channels = $pipes;
+    }
 
     public function read(): ?bool {
         if (empty($this->channels)) {
@@ -409,7 +418,7 @@ class MultiChannelPipe implements Pipe {
 
         $channels_to_check = $this->next_channels();
         foreach($channels_to_check as $channel_name) {
-            if(true !== $this->channels[$channel_name]->read()) {
+            if(!$this->channels[$channel_name]->read()) {
                 continue;
             }
             $this->last_read_channel = $channel_name;
@@ -474,30 +483,6 @@ class MultiChannelPipe implements Pipe {
         return $this->channels[$current_channel]->write($data, $metadata);
     }
 
-    public function ensure_channel($channel_name)
-    {
-        if (isset($this->channels[$channel_name])) {
-            return false;
-        }
-        $this->channels[$channel_name] = new BufferPipe();
-    }
-
-    public function is_channel_eof($channel_name)
-    {
-        if (!isset($this->channels[$channel_name])) {
-            return false;
-        }
-        return $this->channels[$channel_name]->is_eof();
-    }
-
-    public function close_channel($channel_name)
-    {
-        if (!isset($this->channels[$channel_name])) {
-            return false;
-        }
-        return $this->channels[$channel_name]->close();
-    }
-
     public function is_eof(): bool {
         if(!$this->used) {
             return false;
@@ -517,17 +502,6 @@ class MultiChannelPipe implements Pipe {
         }
     }
 }
-
-/**
- * Idea 2: Use a single pipe that keeps track of the `channel` and `file_id` metadata.
- */
-// class MultiplexedPipe implements Pipe
-// {
-//     public function write(string $data, $metadata = null) {
-//         $this->channel = $metadata['channel'] ?? 'default';
-//         $this->file_id = $metadata['file_id'] ?? 'default';
-//     }
-// }
 
 
 class Uppercaser extends TransformProcess {
@@ -590,20 +564,17 @@ class Demultiplexer extends BufferProcessor {
             return false;
         }
 
-        if(false === $subprocess->tick()) {
+        if(!$subprocess->tick()) {
             return false;
         }
     
-        if (true === $subprocess->stdout->read()) {
+        if ($subprocess->stdout->read()) {
             $output = $subprocess->stdout->consume_bytes();
             $chunk_metadata = array_merge(
                 ['channel' => $this->last_input_channel],
                 $subprocess->stdout->get_metadata() ?? [],
             );
             $this->stdout->write($output, $chunk_metadata);
-            if ($subprocess->stdout->is_channel_eof($chunk_metadata['channel'])) {
-                $this->stdout->close_channel($chunk_metadata['channel']);
-            }
             return true;
         }
 
@@ -663,24 +634,12 @@ class ZipReaderProcess extends BufferProcessor {
                 case ZipStreamReader::STATE_FILE_ENTRY:
                     $file_path = $this->reader->get_file_path();
                     if ($this->last_skipped_file === $file_path) {
-                        // break;
+                        break;
                     }
                     $this->stdout->write($this->reader->get_file_body_chunk(), [
                         'file_id' => $file_path,
-                        // We don't want any single chunk to contain mixed bytes from
-                        // multiple files.
-                        // 
-                        // Therefore, we must either:
-                        // 
-                        // * Use a separate channel for each file to have distinct
-                        //   buckets that don't mix.
-                        // * Use a single channel and ensure the unzipped file is fully
-                        //   written and consumed before we start writing the next file.
-                        // 
-                        // The second option requires more implementation complexity and also
-                        // requires checking whether the output pipe has been read completely
-                        // which is very specific to a BufferPipe. The first option seems simpler
-                        // so let's go with that.
+                        // Use a separate channel for each file so the next
+                        // process may separate the files.
                         'channel' => $file_path,
                     ]);
                     return true;
@@ -919,15 +878,6 @@ class HttpClientProcess extends Process {
 		$this->client->enqueue( $requests );
 
         parent::__construct();
-
-        // Pre-open all output channels to ensure the stdout stream
-        // stays open until all the requests conclude. Otherwise,
-        // we could have a window of time when some requests are done,
-        // others haven't started outputting yet, and the stdout stream
-        // is considered EOF.
-        foreach($requests as $request) {
-            $this->stdout->ensure_channel('request_' . $request->id);
-        }
 	}
 
     protected function do_tick($tick_context): bool
@@ -947,11 +897,6 @@ class HttpClientProcess extends Process {
                     $this->stderr->write('Request failed: ' . $request->error, [
                         'request' => $request
                     ]);
-                    $this->stdout->close_channel($output_channel);
-                    break;
-
-                case Client::EVENT_FINISHED:
-                    $this->stdout->close_channel($output_channel);
                     break;
             }
         }
@@ -1077,13 +1022,13 @@ $process = new ProcessChain([
     ]),
 
     'zip' => ZipReaderProcess::stream(),
-    CallbackProcess::stream(function ($data, $context, $process) {
-        if ($context['zip']['file_id'] === 'export.wxr') {
-            $context['zip']->skip_file('export.wxr');
-            return null;
-        }
-        return $data;
-    }),
+    // CallbackProcess::stream(function ($data, $context, $process) {
+    //     if ($context['zip']['file_id'] === 'export.wxr') {
+    //         $context['zip']->skip_file('export.wxr');
+    //         return null;
+    //     }
+    //     return $data;
+    // }),
     'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
     Uppercaser::stream(),
 ]);
