@@ -10,6 +10,10 @@
  * * The process `do_tick` method typically checks for `stdin->is_eof()` and then
  *   whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
  * * Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
+ *   ^ Would the "Process" have the same interface? A `tick()` seems isomorphic to
+ *     "append_bytes()" call followed by "next()". There's a semantic difference in that
+ *     "append_bytes()" pushes the data, while "tick()" pulls the data, but perhaps the push model
+ *     would work better for asynchronous piping.
  * * ✅ Get rid of ProcessManager
  * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
  *      Let's keep stderr after all.
