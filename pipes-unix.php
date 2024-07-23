@@ -7,13 +7,17 @@
  *   I only used it to make the development easier, I got confused with the other attempt in
  *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
  * * Make Process implement the Iterator interface
- * * The process `do_tick` method typically checks for `stdin->is_eof()` and then
- *   whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
- * * Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
- *   ^ Would the "Process" have the same interface? A `tick()` seems isomorphic to
- *     "append_bytes()" call followed by "next()". There's a semantic difference in that
- *     "append_bytes()" pushes the data, while "tick()" pulls the data, but perhaps the push model
- *     would work better for asynchronous piping.
+ * * ✅ The process `do_tick` method typically checks for `stdin->is_eof()` and then
+ *      whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
+ *      ^ the BufferProcessor interface solves that problem.
+ * * ✅ Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
+ *      ^ Would the "Process" have the same interface? A `tick()` seems isomorphic to
+ *        "append_bytes()" call followed by "next()". There's a semantic difference in that
+ *        "append_bytes()" pushes the data, while "tick()" pulls the data, but perhaps the push model
+ *        would work better for asynchronous piping.
+ *      ^^ A single interface for everything doesn't seem to cut it, but the BufferProcessor interface
+ *         with `read()` and `write($bytes, $metadata)` methods seems to be a good fit for XML, ZIP, HTTP.
+ *         It resembles a Pipe interface, too. I wonder if these "Process" classes could be pipes themselves.
  * * ✅ Get rid of ProcessManager
  * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
  *      Let's keep stderr after all.
@@ -35,14 +39,8 @@
  *   ^ Now that each chunk is moved downstream as soon as it's produced, we don't need
  *     to keep multiple buffers around. The only remaining advantage of a MultiChannelPipe
  *     is tracking EOF for each channel separately.
- * * Calling get_metadata() without calling read() first returns the last metadata. This
- *   bit me a few times when I was in a context where I could not call read() first because,
- *   e.g. another process was about to do that. Maybe this is a good thing, as it forces us
- *   to split a pipe in two whenever an intermediate read is involved, e.g. Process A wouldn't
- *   just connect it's stdin to a subprocess A.1, but it would read from stdin, read metadata,
- *   do processing, ant only then write to A.1 stdin. Still, a better error reporting wouldn't hurt.
- * * Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
- *   but let's still add it for a moment just to make sure we're not missing any typed return.
+ * * ✅ Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
+ *      but let's still add it for a moment just to make sure we're not missing any typed return.
  * * ✅ Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
  *      It now returns either "true", which means "I've produced output", or "false", which means
  *      "I haven't produced output".
@@ -52,6 +50,15 @@
  *      PHP streams where fread() never returns null. Let's think this through some more.
  *      ^ Pipe::read() now returns true, false, or null. When it returns true, the data is available
  *        for being consumed via $pipe->consume_bytes().
+ * 
+ * Maybe not do these?
+ * 
+ * * Calling get_metadata() without calling read() first returns the last metadata. This
+ *   bit me a few times when I was in a context where I could not call read() first because,
+ *   e.g. another process was about to do that. Maybe this is a good thing, as it forces us
+ *   to split a pipe in two whenever an intermediate read is involved, e.g. Process A wouldn't
+ *   just connect it's stdin to a subprocess A.1, but it would read from stdin, read metadata,
+ *   do processing, ant only then write to A.1 stdin. Still, a better error reporting wouldn't hurt.
  */
 
 /**
@@ -138,12 +145,12 @@ abstract class Process {
 
     public function run()
     {
-        do {
+        while ($this->is_alive()) {
             $this->tick();
-        } while ($this->is_alive());
+        }
     }
 
-    public function tick($tick_context=null) {
+    public function tick($tick_context=null): bool {
         if(!$this->is_alive()) {
             return false;
         }
@@ -151,7 +158,7 @@ abstract class Process {
         return $this->do_tick($tick_context ?? []);
     }
 
-    abstract protected function do_tick($tick_context);
+    abstract protected function do_tick($tick_context): bool;
 
     public function kill($code) {
         $this->exit_code = $code;
@@ -160,7 +167,7 @@ abstract class Process {
         $this->stderr->close();
     }
 
-    public function reap()
+    public function reap(): bool
     {
         if($this->is_alive()) {
             return false;
@@ -170,16 +177,16 @@ abstract class Process {
         return true;        
     }
 
-    public function is_reaped()
+    public function is_reaped(): bool
     {
         return $this->is_reaped;        
     }
 
-    public function has_crashed() {
+    public function has_crashed(): bool {
         return $this->exit_code !== null && $this->exit_code !== 0;
     }
 
-    public function is_alive() {
+    public function is_alive(): bool {
         return $this->exit_code === null;
     }
 
@@ -194,14 +201,39 @@ abstract class Process {
 
 }
 
-abstract class TransformProcess extends Process {
-    protected function do_tick($tick_context) {
-        if($this->stdin->is_eof()) {
-            $this->kill(0);
+abstract class BufferProcessor extends Process
+{
+    protected function do_tick($tick_context): bool
+    {
+        if(true === $this->read()) {
+            return true;
+        }
+
+        if (!$this->stdin->read()) {
+            if ($this->stdin->is_eof()) {
+                $this->kill(0);
+            }
             return false;
         }
 
-        if(true !== $this->stdin->read()) {
+        $this->write(
+            $this->stdin->consume_bytes(),
+            $this->stdin->get_metadata()
+        );
+
+        return $this->read();
+    }
+
+    abstract protected function write($input_chunk, $metadata);
+    abstract protected function read(): bool;
+}
+
+abstract class TransformProcess extends Process {
+    protected function do_tick($tick_context): bool {
+        if(!$this->stdin->read()) {
+            if($this->stdin->is_eof()) {
+                $this->kill(0);
+            }
             return false;
         }
 
@@ -219,9 +251,9 @@ abstract class TransformProcess extends Process {
 }
 
 interface Pipe {
-    public function read();
-    public function write(string $data, $metadata=null);
-    public function is_eof();
+    public function read(): ?bool;
+    public function write(string $data, $metadata=null): bool;
+    public function is_eof(): bool;
     public function close();
     public function consume_bytes();
     public function get_metadata();
@@ -237,7 +269,7 @@ class BufferPipe implements Pipe {
         $this->buffer = $buffer;        
     }
 
-    public function read() {
+    public function read(): ?bool {
         if(!$this->buffer && $this->closed) {
             return false;
         }
@@ -258,7 +290,7 @@ class BufferPipe implements Pipe {
         return $this->metadata;        
     }
 
-    public function write(string $data, $metadata=null) {
+    public function write(string $data, $metadata=null): bool {
         if($this->closed) {
             return false;
         }
@@ -267,9 +299,10 @@ class BufferPipe implements Pipe {
         }
         $this->buffer .= $data;
         $this->metadata = $metadata;
+        return true;
     }
 
-    public function is_eof() {
+    public function is_eof(): bool {
         return null === $this->buffer && $this->closed;        
     }
 
@@ -287,7 +320,7 @@ class ResourcePipe implements Pipe {
         $this->resource = $resource;
     }
 
-    public function read() {
+    public function read(): ?bool {
         if($this->closed) {
             return false;
         }
@@ -318,18 +351,19 @@ class ResourcePipe implements Pipe {
         return $bytes;
     }
 
-    public function write(string $data, $metadata=null) {
+    public function write(string $data, $metadata=null): bool {
         if($this->closed) {
             return false;
         }
         fwrite($this->resource, $data);
+        return true;
     }
 
     public function get_metadata() {
         return null;
     }
 
-    public function is_eof() {
+    public function is_eof(): bool {
         return $this->closed;        
     }
 
@@ -356,15 +390,7 @@ class MultiChannelPipe implements Pipe {
     private array $channels = [];
     private ?string $last_read_channel = 'default';
 
-    public function add_channel(string $name, $pipe = null) {
-        if(isset($this->channels[$name])) {
-            return false;
-        }
-        $this->channels[$name] = $pipe ?? new BufferPipe();
-        return true;
-    }
-
-    public function read() {
+    public function read(): ?bool {
         if (empty($this->channels)) {
             return false;
         }
@@ -420,8 +446,7 @@ class MultiChannelPipe implements Pipe {
         return $channels_queue;
     }
 
-
-    public function write(string $data, $metadata = null) {
+    public function write(string $data, $metadata = null): bool {
         $this->used = true;
         $current_channel = 'default';
 
@@ -461,12 +486,7 @@ class MultiChannelPipe implements Pipe {
         return $this->channels[$channel_name]->close();
     }
 
-    public function get_channel_pipe($index)
-    {
-        return $this->channels[$index];
-    }
-
-    public function is_eof() {
+    public function is_eof(): bool {
         if(!$this->used) {
             return false;
         }
@@ -485,6 +505,17 @@ class MultiChannelPipe implements Pipe {
         }
     }
 }
+
+/**
+ * Idea 2: Use a single pipe that keeps track of the `channel` and `file_id` metadata.
+ */
+// class MultiplexedPipe implements Pipe
+// {
+//     public function write(string $data, $metadata = null) {
+//         $this->channel = $metadata['channel'] ?? 'default';
+//         $this->file_id = $metadata['file_id'] ?? 'default';
+//     }
+// }
 
 
 class Uppercaser extends TransformProcess {
@@ -514,7 +545,7 @@ class CallbackProcess extends TransformProcess {
     }
 }
 
-class Demultiplexer extends Process {
+class Demultiplexer extends BufferProcessor {
     private $process_factory = [];
     public $subprocesses = [];
     private $killed_subprocesses = [];
@@ -527,22 +558,7 @@ class Demultiplexer extends Process {
         parent::__construct();
     }
 
-    protected function do_tick($tick_context) {
-        if(true === $this->tick_last_subprocess()) {
-            return true;
-        }
-
-        if($this->stdin->is_eof() || $this->stdout->is_eof()) {
-            $this->kill(0);
-            return false;
-        }
-
-        if (true !== $this->stdin->read()) {
-            return false;
-        }
-
-        $next_chunk = $this->stdin->consume_bytes();
-        $metadata = $this->stdin->get_metadata();
+    protected function write($next_chunk, $metadata) {
         $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
         $this->last_input_channel = $input_channel;
         if (!isset($this->subprocesses[$input_channel])) {
@@ -553,11 +569,9 @@ class Demultiplexer extends Process {
         $subprocess = $this->subprocesses[$input_channel];
         $subprocess->stdin->write($next_chunk, $metadata);
         $this->last_subprocess = $subprocess;
-
-        return $this->tick_last_subprocess();
     }
 
-    private function tick_last_subprocess()
+    protected function read(): bool
     {
         $subprocess = $this->last_subprocess;
         if(!$subprocess) {
@@ -607,7 +621,7 @@ class Demultiplexer extends Process {
 
 require __DIR__ . '/zip-stream-reader.php';
 
-class ZipReaderProcess extends Process {
+class ZipReaderProcess extends BufferProcessor {
 
     private $reader;
     private $last_skipped_file = null;
@@ -626,25 +640,11 @@ class ZipReaderProcess extends Process {
         $this->last_skipped_file = $file_id;
     }
 
-    protected function do_tick($tick_context) {
-        if(true === $this->process_buffered_data()) {
-            return true;
-        }
-
-        if($this->stdin->is_eof()) {
-            $this->kill(0);
-            return false;
-        }
-
-        if(true !== $this->stdin->read()) {
-            return false;
-        }
-
-        $this->reader->append_bytes($this->stdin->consume_bytes());
-        return $this->process_buffered_data();
+    protected function write($bytes, $metadata) {
+        $this->reader->append_bytes($bytes);
     }
 
-    protected function process_buffered_data()
+    protected function read(): bool
     {
         while ($this->reader->next()) {
             switch ($this->reader->get_state()) {
@@ -776,7 +776,7 @@ class ProcessChain extends Process {
      * This way we can maintain a predictable $context variable that carries upstream
      * metadata and exposes methods like skip_file().
      */
-    protected function do_tick($tick_context) {
+    protected function do_tick($tick_context): bool {
         if($this->last_subprocess->stdout->is_eof()) {
             $this->kill(0);
             return false;
@@ -920,7 +920,7 @@ class HttpClientProcess extends Process {
         }
 	}
 
-    protected function do_tick($tick_context)
+    protected function do_tick($tick_context): bool
     {
         while($this->client->await_next_event()) {
             $request = $this->client->get_request();
@@ -953,7 +953,7 @@ class HttpClientProcess extends Process {
 }
 
 
-class XMLProcess extends Process {
+class XMLProcess extends BufferProcessor {
 	private $xml_processor;
 	private $node_visitor_callback;
 
@@ -969,25 +969,12 @@ class XMLProcess extends Process {
         parent::__construct();
 	}
 
-    protected function do_tick($tick_context) {
-        if(true === $this->process_buffered_data()) {
-            return true;
-        }
-
-        if($this->stdin->is_eof()) {
-            $this->kill(0);
-            return false;
-        }
-
-        if(true !== $this->stdin->read()) {
-            return false;
-        }
-
-        $this->xml_processor->stream_append_xml($this->stdin->consume_bytes());
-        return $this->process_buffered_data();
+    protected function write($bytes, $metadata)
+    {
+        $this->xml_processor->stream_append_xml($bytes);
     }
 
-    private function process_buffered_data()
+    protected function read(): bool
     {
         if($this->xml_processor->paused_at_incomplete_token()) {
             return false;
