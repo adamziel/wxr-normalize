@@ -26,7 +26,8 @@
  *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
  *     ^ the problem with this is that methods like `skip_file()` affect the currently processed file and we
  *       must call them at the right time
- * * Demultiplexing modes: per input channel, per $metadata['file_id'].
+ * * Demultiplexing modes: per "sequence_id" (e.g. ZIPping a sequence of files), per "file_id" 
+ *   (e.g. XML rewriting each file separately, regardless of the chunks order)
  * * Figure out interop Pipe and MultiChannelPipe – they are not interchangeable. Maybe
  *   we could use metadata to pass the channel name, and the regular pipe would ignore it?
  *   Maybe a MultiChannelPipe would just have special semantics for that metadata field?
