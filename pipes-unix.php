@@ -46,10 +46,12 @@
  * * ✅ Should Process::tick() return a boolean? Or is it fine if it doesn't return anything?
  *      It now returns either "true", which means "I've produced output", or "false", which means
  *      "I haven't produced output".
- * * Pipe::read() returns a string on success, false on failure, or null if there were no writes
- *   since the last read and we'd just return an empty string. This three-state semantics is useful,
- *   but it's painful to always check for false and null, and then it may not interop well with
- *   PHP streams where fread() never returns null. Let's think this through some more.
+ * * ✅ Pipe::read() returns a string on success, false on failure, or null if there were no writes
+ *      since the last read and we'd just return an empty string. This three-state semantics is useful,
+ *      but it's painful to always check for false and null, and then it may not interop well with
+ *      PHP streams where fread() never returns null. Let's think this through some more.
+ *      ^ Pipe::read() now returns true, false, or null. When it returns true, the data is available
+ *        for being consumed via $pipe->consume_bytes().
  */
 
 /**
@@ -199,12 +201,11 @@ abstract class TransformProcess extends Process {
             return false;
         }
 
-        $data = $this->stdin->read();
-        if (null === $data || false === $data) {
+        if(true !== $this->stdin->read()) {
             return false;
         }
 
-        $transformed = $this->transform($data, $tick_context);
+        $transformed = $this->transform($this->stdin->consume_bytes(), $tick_context);
         if (null === $transformed || false === $transformed) {
             return false;
         }
@@ -222,6 +223,7 @@ interface Pipe {
     public function write(string $data, $metadata=null);
     public function is_eof();
     public function close();
+    public function consume_bytes();
     public function get_metadata();
 }
 
@@ -236,12 +238,20 @@ class BufferPipe implements Pipe {
     }
 
     public function read() {
-        $buffer = $this->buffer;
-        if(!$buffer && $this->closed) {
+        if(!$this->buffer && $this->closed) {
             return false;
         }
+        if(null === $this->buffer) {
+            return null;
+        }
+        return true;
+    }
+
+    public function consume_bytes()
+    {
+        $bytes = $this->buffer;
         $this->buffer = null;
-        return $buffer;
+        return $bytes;
     }
 
     public function get_metadata() {
@@ -271,6 +281,7 @@ class BufferPipe implements Pipe {
 class ResourcePipe implements Pipe {
     public $resource;
     private bool $closed = false;
+    private $bytes;
 
     public function __construct($resource) {
         $this->resource = $resource;
@@ -293,7 +304,18 @@ class ResourcePipe implements Pipe {
             return null;
         }
 
-        return $data;
+        if($this->bytes === null) {
+            $this->bytes = '';
+        }
+        $this->bytes .= $data;
+        return true;
+    }
+
+    public function consume_bytes()
+    {
+        $bytes = $this->bytes;
+        $this->bytes = null;
+        return $bytes;
     }
 
     public function write(string $data, $metadata=null) {
@@ -330,7 +352,6 @@ class FilePipe extends ResourcePipe {
  * Idea 1: Use multiple pipes to pass multi-band I/O data between processes.
  */
 class MultiChannelPipe implements Pipe {
-    public $metadata;
     private $used = false;
     private array $channels = [];
     private ?string $last_read_channel = 'default';
@@ -348,19 +369,31 @@ class MultiChannelPipe implements Pipe {
             return false;
         }
 
-        $this->metadata = null;
         $channels_to_check = $this->next_channels();
         foreach($channels_to_check as $channel_name) {
-            $data = $this->channels[$channel_name]->read();
-            if ($data === false || $data === null) {
+            if(true !== $this->channels[$channel_name]->read()) {
                 continue;
             }
             $this->last_read_channel = $channel_name;
-            $this->metadata = $this->channels[$channel_name]->get_metadata();
-            return $data;
+            return true;
         }
 
         return null;
+    }
+
+    public function consume_bytes()
+    {
+        if(!$this->last_read_channel || !isset($this->channels[$this->last_read_channel])) {
+            return null;
+        }
+        return $this->channels[$this->last_read_channel]->consume_bytes();
+    }
+
+    public function get_metadata() {
+        if(!$this->last_read_channel || !isset($this->channels[$this->last_read_channel])) {
+            return null;
+        }
+        return $this->channels[$this->last_read_channel]->get_metadata();
     }
 
     private function next_channels() {
@@ -387,9 +420,6 @@ class MultiChannelPipe implements Pipe {
         return $channels_queue;
     }
 
-    public function get_metadata() {
-        return $this->metadata;
-    }
 
     public function write(string $data, $metadata = null) {
         $this->used = true;
@@ -403,7 +433,7 @@ class MultiChannelPipe implements Pipe {
             $this->channels[$current_channel] = new BufferPipe();
         }
 
-        $this->metadata = $metadata;
+        $this->last_read_channel = $current_channel;
         return $this->channels[$current_channel]->write($data, $metadata);
     }
 
@@ -507,11 +537,11 @@ class Demultiplexer extends Process {
             return false;
         }
 
-        $next_chunk = $this->stdin->read();
-        if (null === $next_chunk || false === $next_chunk) {
+        if (true !== $this->stdin->read()) {
             return false;
         }
 
+        $next_chunk = $this->stdin->consume_bytes();
         $metadata = $this->stdin->get_metadata();
         $input_channel = is_array($metadata) && !empty( $metadata['channel'] ) ? $metadata['channel'] : 'default';
         $this->last_input_channel = $input_channel;
@@ -538,8 +568,8 @@ class Demultiplexer extends Process {
             return false;
         }
     
-        $output = $subprocess->stdout->read();
-        if (null !== $output && false !== $output) {
+        if (true === $subprocess->stdout->read()) {
+            $output = $subprocess->stdout->consume_bytes();
             $chunk_metadata = array_merge(
                 ['channel' => $this->last_input_channel],
                 $subprocess->stdout->get_metadata() ?? [],
@@ -606,12 +636,11 @@ class ZipReaderProcess extends Process {
             return false;
         }
 
-        $bytes = $this->stdin->read();
-        if (null === $bytes || false === $bytes) {
+        if(true !== $this->stdin->read()) {
             return false;
         }
 
-        $this->reader->append_bytes($bytes);
+        $this->reader->append_bytes($this->stdin->consume_bytes());
         return $this->process_buffered_data();
     }
 
@@ -754,11 +783,13 @@ class ProcessChain extends Process {
         }
 
         while(true) {
-            $data = $this->stdin->read();
-            if (null === $data || false === $data) {
+            if(true !== $this->stdin->read()) {
                 break;
             }
-            $this->first_subprocess->stdin->write($data, $this->stdin->get_metadata());
+            $this->first_subprocess->stdin->write(
+                $this->stdin->consume_bytes(),
+                $this->stdin->get_metadata()
+            );
         }
 
         if($this->stdin->is_eof()) {
@@ -795,12 +826,13 @@ class ProcessChain extends Process {
 
             // When the last process in the chain produces output,
             // we write it to the stdout pipe and bale.
-            $data = $this->last_subprocess->stdout->read();
-            if (null === $data || false === $data) {
+            if(true !== $this->last_subprocess->stdout->read()) {
                 break;
             }
-
-            $this->stdout->write($data, $this->tick_context);
+            $this->stdout->write(
+                $this->last_subprocess->stdout->consume_bytes(),
+                $this->tick_context
+            );
             return true;
         }
 
@@ -837,15 +869,11 @@ class ProcessChain extends Process {
     private function handle_errors($process)
     {
         if(!$process->has_crashed()) {
-            while (true) {
-                $err = $process->stderr->read();
-                if (null === $err || false === $err) {
-                    break;
-                }
-                $this->stderr->write($err, [
+            while ($process->stderr->read()) {
+                $this->stderr->write($process->stderr->consume_bytes(), [
                     'type' => 'error',
                     'process' => $process,
-                    ...$process->stderr->get_metadata(),
+                    ...($process->stderr->get_metadata() ?? []),
                 ]);
             }
         }
@@ -951,12 +979,11 @@ class XMLProcess extends Process {
             return false;
         }
 
-        $bytes = $this->stdin->read();
-        if (null === $bytes || false === $bytes) {
+        if(true !== $this->stdin->read()) {
             return false;
         }
 
-        $this->xml_processor->stream_append_xml($bytes);
+        $this->xml_processor->stream_append_xml($this->stdin->consume_bytes());
         return $this->process_buffered_data();
     }
 
