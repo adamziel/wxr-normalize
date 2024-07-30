@@ -22,6 +22,7 @@ interface IByteStream {
     public function input_eof();
     public function append_bytes(string $bytes, $context = null);
     public function is_output_eof(): bool;
+    public function get_bytes(): ?string;
     public function get_last_error(): ?string;
     public function get_file_id(): ?string;
 }
@@ -94,7 +95,7 @@ abstract class ByteStream implements IByteStream {
         $this->state = IByteStream::STATE_FINISHED;
     }
 
-    public function get_bytes()
+    public function get_bytes(): ?string
     {
         return $this->output_bytes;
     }
