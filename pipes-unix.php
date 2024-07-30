@@ -158,7 +158,6 @@ use WordPress\AsyncHttp\Request;
 
 abstract class Process implements ArrayAccess {
     private ?int $exit_code = null;
-    private bool $is_reaped = false;
     protected Pipe $input;
     protected Pipe $output;
     protected Pipe $errors;
@@ -168,13 +167,6 @@ abstract class Process implements ArrayAccess {
         $this->input = $input ?? new BufferPipe();
         $this->output = $output ?? new BufferPipe();
         $this->errors = $errors ?? new BufferPipe();
-    }
-
-    public function run()
-    {
-        while ($this->is_alive()) {
-            $this->tick();
-        }
     }
 
     public function tick($tick_context=null): bool {
@@ -192,21 +184,7 @@ abstract class Process implements ArrayAccess {
         $this->input->close();
         $this->output->close();
         $this->errors->close();
-    }
-
-    public function reap(): bool
-    {
-        if($this->is_alive()) {
-            return false;
-        }
-        $this->is_reaped = true;
         $this->cleanup();
-        return true;        
-    }
-
-    public function is_reaped(): bool
-    {
-        return $this->is_reaped;        
     }
 
     public function has_crashed(): bool {
@@ -707,7 +685,7 @@ class ProcessChain extends Process implements Iterator {
     private $last_subprocess;
     public $subprocesses = [];
     public $subprocesses_names = [];
-    private $reaped_pids = [];
+    private $reaped_subprocesses = [];
     private $execution_stack = [];
     private $tick_context = [];
 
@@ -864,14 +842,13 @@ class ProcessChain extends Process implements Iterator {
         }
 
         if($process->has_crashed()) {
-            if (!$process->is_reaped()) {
-                $process->reap();
-                $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
+            $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
+            if(!isset($this->reaped_subprocesses[$name])) {
                 $this->errors->write("Process $name has crashed with code {$process->exit_code}", [
                     'type' => 'crash',
                     'process' => $process,
-                    'reaped' => true,
                 ]);
+                $this->reaped_subprocesses[$name] = true;
             }
         }
     }
