@@ -870,14 +870,25 @@ class WP_XML_Tag_Processor {
 	 *
 	 *     $processor = new WP_XML_Tag_Processor( '<input type="text" value="Th' );
 	 *     false      === $processor->get_next_tag();
-	 *     true       === $processor->paused_at_incomplete_token();
+	 *     true       === $processor->is_paused_at_incomplete_token();
 	 *
 	 * @since WP_VERSION
 	 *
 	 * @return bool Whether the parse paused at the start of an incomplete token.
 	 */
-	public function paused_at_incomplete_token() {
+	public function is_paused_at_incomplete_input(): bool {
 		return self::STATE_INCOMPLETE_INPUT === $this->parser_state;
+	}
+
+	/**
+	 * Whether the processor finished processing.
+	 *
+	 * @since WP_VERSION
+	 *
+	 * @return bool Whether the processor finished processing.
+	 */
+	public function is_finished(): bool {
+		return self::STATE_COMPLETE === $this->parser_state;
 	}
 
 	/**
@@ -1073,7 +1084,7 @@ class WP_XML_Tag_Processor {
 	 *
 	 * @return string|null The last error, if one exists, otherwise null.
 	 */
-	public function get_last_error() {
+	public function get_last_error(): ?string {
 		return $this->last_error;
 	}
 

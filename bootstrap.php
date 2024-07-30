@@ -9,6 +9,7 @@ if(!file_exists(WP_XML_API_PATH . '/class-wp-token-map.php')) {
     copy(WP_XML_API_PATH.'/../class-wp-token-map.php', WP_XML_API_PATH . '/class-wp-token-map.php');
 }
 
+$requires[] = WP_XML_API_PATH . "/IStreamProcessor.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-html-token.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-html-span.php";
 $requires[] = WP_XML_API_PATH . "/class-wp-html-text-replacement.php";

@@ -2,7 +2,7 @@
 
 define('RUN_ZIP_SMOKE_TEST', false);
 
-class ZipStreamReader {
+class ZipStreamReader implements IStreamProcessor {
 
 	const SIGNATURE_FILE                  = 0x04034b50;
 	const SIGNATURE_CENTRAL_DIRECTORY     = 0x02014b50;
@@ -32,14 +32,20 @@ class ZipStreamReader {
 		$this->zip = $bytes;
 	}
 
-	public function append_bytes($bytes)
+	public function append_bytes(string $bytes)
 	{
 		$this->zip = substr($this->zip, $this->bytes_parsed_so_far) . $bytes;	
-        $this->bytes_parsed_so_far = 0;	
+        $this->bytes_parsed_so_far = 0;
+		$this->paused_incomplete_input = false;
 	}
 
-	public function paused_at_incomplete_token() {
+	public function is_paused_at_incomplete_input(): bool {
 		return $this->paused_incomplete_input;		
+	}
+
+	public function is_finished(): bool
+	{
+		return self::STATE_COMPLETE === $this->state || self::STATE_ERROR === $this->state;
 	}
 
     public function get_state()
@@ -66,7 +72,7 @@ class ZipStreamReader {
         return $this->file_body_chunk;        
     }
 
-    public function get_error_message()
+    public function get_last_error(): ?string
     {
         return $this->error_message;        
     }
@@ -337,14 +343,14 @@ if (RUN_ZIP_SMOKE_TEST) {
             }
             echo "\n";
         }
-        if ($reader->paused_at_incomplete_token()) {
+        if ($reader->is_paused_at_incomplete_input()) {
             if (feof($fp)) {
                 break;
             }
             $reader->append_bytes(fread($fp, 1024));
         }
         if (ZipStreamReader::STATE_ERROR === $reader->get_state()) {
-            echo 'Error: ' . $reader->get_error_message() . "\n";
+            echo 'Error: ' . $reader->get_last_error() . "\n";
             break;
         }
     }

@@ -229,7 +229,7 @@ class XMLProcessorStream implements TransformStream {
 	}
 
 	protected function doWrite( string $data, ?StreamedFileContext $context=null ): bool {
-		$this->xml_processor->stream_append_xml( $data );
+		$this->xml_processor->append_bytes( $data );
 
 		return true;
 	}

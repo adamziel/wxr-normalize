@@ -10,7 +10,7 @@
 /**
  * @since WP_VERSION
  */
-class WP_XML_Processor extends WP_XML_Tag_Processor {
+class WP_XML_Processor extends WP_XML_Tag_Processor implements IStreamProcessor {
 
 	/**
 	 * Indicates the current parsing stage.
@@ -60,7 +60,7 @@ class WP_XML_Processor extends WP_XML_Tag_Processor {
 			$token_found = $processor->next_token();
 			$processor->get_updated_xml();
 
-			if ( $processor->paused_at_incomplete_token() ) {
+			if ( $processor->is_paused_at_incomplete_input() ) {
 				fwrite( $output_stream, $processor->get_processed_xml() );
 
 				$next_chunk = fread( $input_stream, $buffer_size );
@@ -94,7 +94,7 @@ class WP_XML_Processor extends WP_XML_Tag_Processor {
 	 * 
 	 * @param string $next_chunk XML to append.
 	 */
-	public function stream_append_xml( $next_chunk )
+	public function append_bytes( string $next_chunk )
 	{
 		$this->get_updated_xml();
 

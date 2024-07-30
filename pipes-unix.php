@@ -3,7 +3,42 @@
 /**
  * @TODO:
  *
- * * Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
+ * * ✅ Consider an interface for all streamable processor classes to make them chainable.
+ *     ^ Here's some reasons not to do that:
+ *       
+ *       1. The same processor may need multiple stream implementations. For example,
+ *          an XML processor may be used to transform the document, so go from XML bytes to XML bytes,
+ *          but it can also be used to extract HTML from CDATA, so go from XML bytes to HTML bytes.
+ *       2. Not all processor must output bytes, and for some processors, the metadata may be much more
+ *          important than the actual output bytes.
+ *       3. Exposing a method like Processor::chain($processor_2) means we can call it multiple times,
+ *          which means we either need to handle forking the stream or track the chaining state and 
+ *          handle errors in all ambiguous cases.
+ *       4. A method like Processor::next() would be ambiguous:
+ *          * For HTML and XML processors it could mean "next token", "next tag", or "next bytes chunk"
+ *          * For a ZIP processor it could mean "next file", "next ZIP entry", or "next file chunk"
+ *          * ...etc...
+ *          A set of processor-specific methods, such as next_token(), next_tag(), next_file() etc. seems
+ *          like a more intuitive choice.
+ * 
+ *       However, it would still be useful to have *some* common interface there. Perhaps this could work:
+ * 
+ *       interface StreamProcessor {
+ *          public function append_bytes($bytes): bool;
+ *          public function is_finished(): bool;
+ *          public function is_paused_at_incomplete_input(): bool;
+ *       }
+ * 
+ *       I am on the fence about adding the following method:
+ * 
+ *       interface StreamProcessor {
+ *          public function get_last_error(): ?string;
+ *       }
+ * 
+ *       Keeping Processors separate from Stream implementations seems useful. This way we don't have to
+ *       worry about stdin/stdout/stderr etc. and can focus on actual processing. The stream will figure
+ *       out how to use the processor semantics to transform byte chunks. 
+ * * ✅ Find a naming scheme that doesn't suggest we're working with actual Unix processes and pipes.
  *   I only used it to make the development easier, I got confused with the other attempt in
  *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
  * * ✅ Explore merging Pipes and Processes into a single concept after all.
@@ -153,6 +188,8 @@
  *   for is_eof() on errors, but we still have to close that errors pipe.
  */
 
+ require __DIR__ . '/bootstrap.php';
+
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
@@ -258,6 +295,56 @@ abstract class BufferStream extends Stream
 
     abstract protected function write($input_chunk, $metadata, $tick_context);
     abstract protected function read(): bool;
+}
+
+
+abstract class ProcessorStream extends Stream
+{
+
+    protected IStreamProcessor $processor;
+
+    public function __construct($input = null, $output = null, $errors = null)
+    {
+        parent::__construct($input, $output, $errors);
+        $this->processor = $this->create_processor();
+    }
+
+    public function get_processor()
+    {
+        return $this->processor;        
+    }
+
+    abstract protected function create_processor(): IStreamProcessor;
+
+    protected function do_tick($tick_context): bool
+    {
+        if(true === $this->next()) {
+            return true;
+        }
+
+        if (!$this->input->read()) {
+            if ($this->input->is_eof()) {
+                $this->finish();
+            }
+            return false;
+        }
+
+        $this->processor->append_bytes($this->input->consume_bytes());
+        
+        if($this->processor->is_paused_at_incomplete_input()) {
+            return false;
+        }
+
+        if ($this->processor->get_last_error()) {
+            $this->crash($this->processor->get_last_error());
+            return false;
+        }
+
+        return $this->next();
+    }
+
+    abstract protected function next(): bool;
+
 }
 
 abstract class TransformerStream extends BufferStream {
@@ -424,112 +511,6 @@ class FilePipe extends ResourcePipe {
     }
 }
 
-/**
- * This isn't used anymore. Yay! It could be just removed,
- * but it looks useful so let's keep it around for a while.
- */
-class MultiplexingPipe implements Pipe {
-    private $used = false;
-    private array $sequences = [];
-    private ?string $last_read_sequence = 'default';
-
-    public function __construct(array $pipes = [])
-    {
-        $this->sequences = $pipes;
-    }
-
-    public function read(): ?bool {
-        if (empty($this->sequences)) {
-            return false;
-        }
-
-        $sequences_to_check = $this->next_sequences();
-        foreach($sequences_to_check as $sequence_name) {
-            if(!$this->sequences[$sequence_name]->read()) {
-                continue;
-            }
-            $this->last_read_sequence = $sequence_name;
-            return true;
-        }
-
-        return null;
-    }
-
-    public function consume_bytes()
-    {
-        if(!$this->last_read_sequence || !isset($this->sequences[$this->last_read_sequence])) {
-            return null;
-        }
-        return $this->sequences[$this->last_read_sequence]->consume_bytes();
-    }
-
-    public function get_metadata() {
-        if(!$this->last_read_sequence || !isset($this->sequences[$this->last_read_sequence])) {
-            return null;
-        }
-        return $this->sequences[$this->last_read_sequence]->get_metadata();
-    }
-
-    private function next_sequences() {
-        $sequences_queue = [];
-        $sequence_names = array_keys($this->sequences);
-        $last_read_sequence_index = array_search($this->last_read_sequence, $sequence_names);
-        if(false === $last_read_sequence_index) {
-            $last_read_sequence_index = 0;
-        } else if($last_read_sequence_index > count($sequence_names)) {
-            $last_read_sequence_index = count($sequence_names) - 1;
-        }
-
-        $this->last_read_sequence = null;
-        for ($i = 1; $i <= count($sequence_names); $i++) {
-            $key_index = ($last_read_sequence_index + $i) % count($sequence_names);
-            $sequence_name = $sequence_names[$key_index];
-            if($this->sequences[$sequence_name]->is_eof()) {
-                unset($this->sequences[$sequence_name]);
-                continue;
-            }
-            $this->last_read_sequence = $sequence_name;
-            $sequences_queue[] = $sequence_name;
-        }
-        return $sequences_queue;
-    }
-
-    public function write(string $data, $metadata = null): bool {
-        $this->used = true;
-        $current_sequence = 'default';
-
-        if(is_array($metadata) && isset($metadata['sequence'])) {
-            $current_sequence = $metadata['sequence'];
-        }
-
-        if (!isset($this->sequences[$current_sequence])) {
-            $this->sequences[$current_sequence] = new BufferPipe();
-        }
-
-        $this->last_read_sequence = $current_sequence;
-        return $this->sequences[$current_sequence]->write($data, $metadata);
-    }
-
-    public function is_eof(): bool {
-        if(!$this->used) {
-            return false;
-        }
-        foreach ($this->sequences as $pipe) {
-            if (!$pipe->is_eof()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    public function close() {
-        $this->used = true;
-        foreach ($this->sequences as $pipe) {
-            $pipe->close();
-        }
-    }
-}
-
 class CallbackStream extends TransformerStream {
     private $callback;
     
@@ -628,23 +609,21 @@ class Demultiplexer extends BufferStream {
 
 require __DIR__ . '/zip-stream-reader.php';
 
-class ZipReaderStream extends BufferStream {
+class ZipReaderStream extends ProcessorStream {
 
-    private $reader;
+    /**
+     * @var ZipStreamReader
+     */
+	protected IStreamProcessor $processor;
     private $last_skipped_file = null;
 
     static public function create() {
         return new Demultiplexer(fn() => new ZipReaderStream());
     }
 
-    protected function __construct() {
-        parent::__construct();
-        $this->reader = new ZipStreamReader('');
-    }
-
-    public function get_zip_reader()
+    protected function create_processor(): IStreamProcessor
     {
-        return $this->reader;
+        return new ZipStreamReader('');
     }
 
     public function skip_file($file_id)
@@ -652,20 +631,16 @@ class ZipReaderStream extends BufferStream {
         $this->last_skipped_file = $file_id;
     }
 
-    protected function write($bytes, $metadata, $tick_context) {
-        $this->reader->append_bytes($bytes);
-    }
-
-    protected function read(): bool
+    protected function next(): bool
     {
-        while ($this->reader->next()) {
-            switch ($this->reader->get_state()) {
+        while ($this->processor->next()) {
+            switch ($this->processor->get_state()) {
                 case ZipStreamReader::STATE_FILE_ENTRY:
-                    $file_path = $this->reader->get_file_path();
+                    $file_path = $this->processor->get_file_path();
                     if ($this->last_skipped_file === $file_path) {
                         break;
                     }
-                    $this->output->write($this->reader->get_file_body_chunk(), [
+                    $this->output->write($this->processor->get_file_body_chunk(), [
                         'file_id' => $file_path,
                         // Use a separate sequence for each file so the next
                         // process may separate the files.
@@ -767,7 +742,7 @@ class StreamChain extends Stream implements Iterator {
                 continue;
             }
 
-            if(true !== $this->tick_stream($stream)) {
+            if(true !== $this->stream_next($stream)) {
                 continue;
             }
 
@@ -777,7 +752,7 @@ class StreamChain extends Stream implements Iterator {
 
             for ($i = count($this->execution_stack); $i < count($this->streams_names); $i++) {
                 $next_stream = $this->streams[$this->streams_names[$i]];
-                if (true !== $this->tick_stream($next_stream)) {
+                if (true !== $this->stream_next($next_stream)) {
                     break;
                 }
                 $this->push_stream($next_stream);
@@ -822,7 +797,7 @@ class StreamChain extends Stream implements Iterator {
         $this->tick_context[$name] = $stream;
     }
 
-    private function tick_stream($stream)
+    private function stream_next($stream)
     {
         $produced_output = $stream->tick($this->tick_context);
         $this->handle_errors($stream);
@@ -951,9 +926,12 @@ class HttpStream extends Stream {
 }
 
 
-class XMLTransformStream extends BufferStream {
-	private $xml_processor;
+class XMLTransformStream extends ProcessorStream {
 	private $node_visitor_callback;
+    /**
+     * @var WP_XML_Processor
+     */
+	protected IStreamProcessor $processor;
 
     static public function create($node_visitor_callback) {
         return new Demultiplexer(fn () =>
@@ -962,49 +940,34 @@ class XMLTransformStream extends BufferStream {
     }
 
 	private function __construct( $node_visitor_callback ) {
-		$this->xml_processor         = new WP_XML_Processor( '', [], WP_XML_Processor::IN_PROLOG_CONTEXT );
 		$this->node_visitor_callback = $node_visitor_callback;
         parent::__construct();
 	}
 
-    public function get_xml_processor()
+    protected function create_processor(): IStreamProcessor
     {
-        return $this->xml_processor;
+        return new WP_XML_Processor( '', [], WP_XML_Processor::IN_PROLOG_CONTEXT );
     }
 
-    protected function write($bytes, $metadata, $tick_context)
+    protected function next(): bool
     {
-        $this->xml_processor->stream_append_xml($bytes);
-    }
-
-    protected function read(): bool
-    {
-        if($this->xml_processor->paused_at_incomplete_token()) {
-            return false;
-        }
-
-		if ( $this->xml_processor->get_last_error() ) {
-            $this->crash( $this->xml_processor->get_last_error() );
-			return false;
-		}
-
         $tokens_found = 0;
-		while ( $this->xml_processor->next_token() ) {
+		while ( $this->processor->next_token() ) {
 			++ $tokens_found;
 			$node_visitor_callback = $this->node_visitor_callback;
-			$node_visitor_callback( $this->xml_processor );
+			$node_visitor_callback( $this->processor );
 		}
 
         $buffer = '';
 		if ( $tokens_found > 0 ) {
-			$buffer .= $this->xml_processor->get_updated_xml();
+			$buffer .= $this->processor->get_updated_xml();
 		} else if ( 
             $tokens_found === 0 && 
-            ! $this->xml_processor->paused_at_incomplete_token() &&
-            $this->xml_processor->get_current_depth() === 0
+            ! $this->processor->is_paused_at_incomplete_input() &&
+            $this->processor->get_current_depth() === 0
         ) {
             // We've reached the end of the document, let's finish up.
-			$buffer .= $this->xml_processor->get_unprocessed_xml();
+			$buffer .= $this->processor->get_unprocessed_xml();
             $this->finish();
 		}
 
@@ -1048,8 +1011,6 @@ function is_wxr_content_node( WP_XML_Processor $processor ) {
 	return false;
 };
 
-require __DIR__ . '/bootstrap.php';
-
 
 $stream = new StreamChain(
     [
@@ -1064,7 +1025,7 @@ $stream = new StreamChain(
                 $context['zip']->skip_file('export.wxr');
                 return null;
             }
-            print_r($context['zip']->get_zip_reader()->get_header());
+            print_r($context['zip']->get_processor()->get_header());
             return $data;
         }),
         'xml' => XMLTransformStream::create(function (WP_XML_Processor $processor) {
