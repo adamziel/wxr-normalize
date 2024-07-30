@@ -156,7 +156,7 @@
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
-abstract class Process implements ArrayAccess {
+abstract class Stream implements ArrayAccess {
 
     const STATE_STREAMING = '#streaming';
     const STATE_FINISHED = '#finished';
@@ -232,7 +232,7 @@ abstract class Process implements ArrayAccess {
 
 }
 
-abstract class BufferProcessor extends Process
+abstract class BufferStream extends Stream
 {
     protected function do_tick($tick_context): bool
     {
@@ -260,7 +260,7 @@ abstract class BufferProcessor extends Process
     abstract protected function read(): bool;
 }
 
-abstract class TransformProcess extends BufferProcessor {
+abstract class TransformerStream extends BufferStream {
 
     protected $buffer;
     protected $metadata;
@@ -530,17 +530,7 @@ class MultiplexingPipe implements Pipe {
     }
 }
 
-
-class Uppercaser extends TransformProcess {
-    static public function stream() {
-        return fn() => new static();
-    }
-    protected function transform($data, $tick_context) {
-        return strtoupper($data);
-    }
-}
-
-class CallbackProcess extends TransformProcess {
+class CallbackStream extends TransformerStream {
     private $callback;
     
     static public function stream($callback) {
@@ -558,7 +548,7 @@ class CallbackProcess extends TransformProcess {
     }
 }
 
-class Demultiplexer extends BufferProcessor {
+class Demultiplexer extends BufferStream {
     private $process_factory = [];
     public $subprocesses = [];
     private $killed_subprocesses = [];
@@ -638,13 +628,13 @@ class Demultiplexer extends BufferProcessor {
 
 require __DIR__ . '/zip-stream-reader.php';
 
-class ZipReaderProcess extends BufferProcessor {
+class ZipReader extends BufferStream {
 
     private $reader;
     private $last_skipped_file = null;
 
     static public function stream() {
-        return fn () => new Demultiplexer(fn() => new ZipReaderProcess());
+        return fn () => new Demultiplexer(fn() => new ZipReader());
     }
 
     protected function __construct() {
@@ -689,7 +679,7 @@ class ZipReaderProcess extends BufferProcessor {
     }
 }
 
-class ProcessChain extends Process implements Iterator {
+class StreamChain extends Stream implements Iterator {
     private $first_subprocess;
     private $last_subprocess;
     public $subprocesses = [];
@@ -917,14 +907,14 @@ class ProcessChain extends Process implements Iterator {
 }
 
 
-class HttpClientProcess extends Process {
+class HttpStream extends Stream {
 	private $client;
 	private $requests = [];
 	private $child_contexts = [];
 	private $skipped_requests = [];
 
     static public function stream($requests) {
-        return fn () => new HttpClientProcess($requests);
+        return fn () => new HttpStream($requests);
     }
 
 	private function __construct( $requests ) {
@@ -962,13 +952,13 @@ class HttpClientProcess extends Process {
 }
 
 
-class XMLProcess extends BufferProcessor {
+class XMLStream extends BufferStream {
 	private $xml_processor;
 	private $node_visitor_callback;
 
     static public function stream($node_visitor_callback) {
         return fn () => new Demultiplexer(fn () =>
-            new XMLProcess($node_visitor_callback)
+            new XMLStream($node_visitor_callback)
         );
     }
 
@@ -1072,16 +1062,16 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 require __DIR__ . '/bootstrap.php';
 
 
-$process = new ProcessChain(
+$process = new StreamChain(
     [
-        HttpClientProcess::stream([
+        HttpStream::stream([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
             // Bad request, will fail:
             new Request('http://127.0.0.1:9865'),
         ]),
 
-        'zip' => ZipReaderProcess::stream(),
-        CallbackProcess::stream(function ($data, $context, $process) {
+        'zip' => ZipReader::stream(),
+        CallbackStream::stream(function ($data, $context, $process) {
             if ($context['zip']['file_id'] !== 'export.wxr') {
                 $context['zip']->skip_file('export.wxr');
                 return null;
@@ -1089,32 +1079,17 @@ $process = new ProcessChain(
             print_r($context['zip']->get_zip_reader()->get_header());
             return $data;
         }),
-        'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
-        Uppercaser::stream(),
+        'xml' => XMLStream::stream($rewrite_links_in_wxr_node),
+        CallbackStream::stream(function ($data, $context, $process) {
+            return strtoupper($data);
+        })
     ],
     null,
     null,
     new FilePipe('php://stderr', 'w')
 );
+
 foreach($process as $k => $chunk) {
     var_dump([$k => $chunk]);
 }
 
-function log_process_chain_errors($process) {
-    return;
-    if(!($process->errors instanceof BufferPipe)) {
-        return;
-    }
-    
-    $error = $process->errors->read();
-    if ($error) {
-        echo 'Error: ' . $error . "\n";
-        $meta = $process->errors->get_metadata();
-        if ($meta['type'] ?? '' === 'crash') {
-            $child_error = $meta['process']->errors->read();
-            if ($child_error) {
-                echo 'CRASH: ' . $meta['process']->errors->read() . "\n";
-            }
-        }
-    }    
-}
