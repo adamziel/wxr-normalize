@@ -24,7 +24,11 @@ interface IByteStream {
     public function is_output_eof(): bool;
     public function get_bytes(): ?string;
     public function get_last_error(): ?string;
+}
+
+interface IFilesStream extends IByteStream {
     public function get_file_id(): ?string;
+    public function skip_file(): void;
 }
 
 abstract class ByteStream implements IByteStream {
@@ -33,6 +37,7 @@ abstract class ByteStream implements IByteStream {
     private ?string $output_bytes = null;
     protected string $state = IByteStream::STATE_STREAMING;
     private ?string $last_error = null;
+    private $last_skipped_file = null;
     protected $input_context = null;
 
     public function append_bytes(string $bytes, $context = null) {
@@ -56,6 +61,11 @@ abstract class ByteStream implements IByteStream {
         $this->last_error = $error;
     }
 
+    public function skip_file()
+    {
+        $this->last_skipped_file = $this->get_file_id();
+    }
+    
     protected function consume_input_bytes() {
         $bytes = $this->input_bytes;
         $this->input_bytes = null;
@@ -74,18 +84,19 @@ abstract class ByteStream implements IByteStream {
             return false;
         }
 
-        if(true === $this->tick()) {
-            return true;
+        // Process any remaining buffered input:
+        if($this->tick()) {
+            return $this->get_file_id() !== $this->last_skipped_file;
         }
 
         if (!$this->input_bytes) {
-            if($this->input_eof) {
+            if ($this->input_eof) {
                 $this->finish();
             }
             return false;
         }
 
-        return $this->tick();
+        return $this->tick() && $this->get_file_id() !== $this->last_skipped_file;
     }
 
     abstract protected function tick(): bool;
@@ -118,7 +129,6 @@ class ZipReaderStream extends ByteStream {
      * @var ZipStreamReader
      */
 	protected IStreamProcessor $processor;
-    private $last_skipped_file = null;
     private $file_id;
 
     static public function create() {
@@ -130,11 +140,6 @@ class ZipReaderStream extends ByteStream {
         $this->processor = new ZipStreamReader('');
     }
 
-    public function skip_file()
-    {
-        $this->last_skipped_file = $this->file_id;
-    }
-    
     public function get_file_id(): string|null
     {
         return $this->file_id;
@@ -157,9 +162,6 @@ class ZipReaderStream extends ByteStream {
             switch ($this->processor->get_state()) {
                 case ZipStreamReader::STATE_FILE_ENTRY:
                     $file_path = $this->processor->get_file_path();
-                    if ($this->last_skipped_file === $file_path) {
-                        break;
-                    }
                     $this->file_id = $file_path;
                     $this->set_output_bytes($this->processor->get_file_body_chunk());
                     return true;
@@ -663,7 +665,7 @@ $chain = new StreamChain(
 // Or like this:
 // $chain->iterate_errors(true);
 foreach($chain as $k => $chunk_or_error) {
-    $chunk_or_error && var_dump([
+    var_dump([
         $k => $chunk_or_error,
         'is_error' => !!$chain->get_last_error(),
         'zip file_id' => isset($chain['zip']) ? $chain['zip']->get_file_id() : null
