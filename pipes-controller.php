@@ -334,7 +334,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             for ($i = count($this->execution_stack); $i < count($this->streams_names); $i++) {
                 $next_stream = $this->streams[$this->streams_names[$i]];
                 if($prev_stream->is_eof()) {
-                    $next_stream->state->append_eof();
+                    $next_stream->append_eof();
                 }
 
                 $next_stream->append_bytes(
