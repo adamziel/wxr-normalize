@@ -1049,16 +1049,6 @@ function is_wxr_content_node( WP_XML_Processor $processor ) {
 	return false;
 };
 
-$rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
-	if (is_wxr_content_node($processor)) {
-		$text = $processor->get_modifiable_text();
-		$updated_text = 'Hey there, what\'s up?';
-		if ($updated_text !== $text) {
-			$processor->set_modifiable_text($updated_text);
-		}
-	}
-};
-
 require __DIR__ . '/bootstrap.php';
 
 
@@ -1069,7 +1059,6 @@ $process = new StreamChain(
             // Bad request, will fail:
             new Request('http://127.0.0.1:9865'),
         ]),
-
         'zip' => ZipReader::stream(),
         CallbackStream::stream(function ($data, $context, $process) {
             if ($context['zip']['file_id'] !== 'export.wxr') {
@@ -1079,7 +1068,15 @@ $process = new StreamChain(
             print_r($context['zip']->get_zip_reader()->get_header());
             return $data;
         }),
-        'xml' => XMLStream::stream($rewrite_links_in_wxr_node),
+        'xml' => XMLStream::stream(function (WP_XML_Processor $processor) {
+            if (is_wxr_content_node($processor)) {
+                $text = $processor->get_modifiable_text();
+                $updated_text = 'Hey there, what\'s up?';
+                if ($updated_text !== $text) {
+                    $processor->set_modifiable_text($updated_text);
+                }
+            }
+        }),
         CallbackStream::stream(function ($data, $context, $process) {
             return strtoupper($data);
         })
