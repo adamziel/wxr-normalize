@@ -9,74 +9,86 @@ use WordPress\AsyncHttp\Request;
 class Byte_Stream {
 
     protected $next_bytes_callback;
-    protected $controller;
+    protected $state;
 
     static public function map($callback) {
-        return new Byte_Stream(function($controller) use ($callback) {
-            $bytes = $controller->consume_input_bytes();
+        return new Byte_Stream(function($state) use ($callback) {
+            $bytes = $state->consume_input_bytes();
             if(!$bytes) {
                 return false;
             }
-            $output = $callback($bytes, $controller->input_context);
+            $output = $callback($bytes, $state->input_context);
             if(null === $output) {
                 return false;
             }
-            $controller->output_bytes = $output;
+            $state->output_bytes = $output;
             return true;
         });
     }
 
     public function __construct($next_bytes_callback) {
         $this->next_bytes_callback = $next_bytes_callback;
-        $this->controller = new ByteStreamController();
+        $this->state = new ByteStreamState();
+    }
+
+    public function is_eof(): bool {
+        return !$this->state->output_bytes && $this->state->state === ByteStreamState::STATE_FINISHED;
     }
 
     public function get_file_id()
     {
-        return $this->controller->get_file_id();
+        return $this->state->file_id;
     }
 
-    public function skip_file()
+    public function skip_file(): void {
+        $this->state->last_skipped_file = $this->state->file_id;
+    }
+    
+    public function is_skipped_file()
     {
-        $this->controller->skip_file();        
+        return $this->state->file_id === $this->state->last_skipped_file;
+    }
+
+    public function append_eof() {
+        $this->state->input_eof = true;
     }
 
     public function append_bytes(string $bytes, $context = null) {
-        $this->controller->append_bytes($bytes, $context);
+        $this->state->input_bytes .= $bytes;
+        $this->state->input_context = $context;
     }
 
     public function get_bytes()
     {
-        return $this->controller->output_bytes;        
-    }
-
-    public function get_last_error(): string|null
-    {
-        return $this->controller->get_last_error();        
+        return $this->state->output_bytes;
     }
 
     public function next_bytes()
     {
-        $this->controller->output_bytes = null;
-        $this->controller->last_error = null;
-        if($this->controller->is_output_eof()) {
+        $this->state->reset_output();
+        if($this->is_eof()) {
             return false;
         }
 
         // Process any remaining buffered input:
         $calback = $this->next_bytes_callback;
-        if($calback($this->controller)) {
-            return ! $this->controller->is_skipped_file();
+        if($calback($this->state)) {
+            return ! $this->is_skipped_file();
         }
 
-        if (!$this->controller->input_bytes) {
-            if ($this->controller->input_eof) {
+        if (!$this->state->input_bytes) {
+            if ($this->state->input_eof) {
                 $this->finish();
             }
             return false;
         }
 
-        return $calback($this->controller) && ! $this->controller->is_skipped_file();
+        return $calback($this->state) && ! $this->is_skipped_file();
+    }
+
+    public function get_last_error(): string|null
+    {
+        return $this->state->last_error;
     }
 
 }
@@ -100,7 +112,7 @@ class ProcessorByteStream extends Byte_Stream
  * are only Byte Streams that can be chained together with the StreamChain
  * class.
  */
-class ByteStreamController {
+class ByteStreamState {
     const STATE_STREAMING = '#streaming';
     const STATE_FINISHED = '#finished';
 
@@ -114,41 +126,17 @@ class ByteStreamController {
     public $file_id;
     public $last_skipped_file;
 
-    public function append_bytes(string $bytes, $context = null) {
-        $this->input_bytes .= $bytes;
-        $this->input_context = $context;
+    public function reset_output()
+    {
+        $this->output_bytes = null;
+        $this->file_id = 'default';
+        $this->last_error = null;
     }
 
-    public function input_eof() {
-        $this->input_eof = true;
-    }
-
-    public function is_output_eof(): bool {
-        return !$this->output_bytes && $this->state === self::STATE_FINISHED;
-    }
-
-    public function get_last_error(): ?string {
-        return $this->last_error;
-    }
-
-    public function set_last_error($error) {
-        $this->last_error = $error;
-    }
-    
     public function consume_input_bytes() {
         $bytes = $this->input_bytes;
         $this->input_bytes = null;
         return $bytes;
-    }
-
-    public function get_file_id()
-    {
-        return $this->file_id ?? 'default';
-    }
-
-    public function is_skipped_file()
-    {
-        return $this->get_file_id() === $this->last_skipped_file;        
     }
 
     public function finish()
@@ -156,9 +144,6 @@ class ByteStreamController {
         $this->state = self::STATE_FINISHED;
     }
 
-    public function skip_file(): void {
-        $this->last_skipped_file = $this->file_id;
-    }
 }
 
 function is_wxr_content_node( WP_XML_Processor $processor ) {
@@ -215,13 +200,13 @@ class Demultiplexer extends Byte_Stream {
         }
 
         if($stream->next_bytes()) {
-            $this->controller->file_id = $stream->controller->get_file_id();
-            $this->controller->output_bytes = $stream->get_bytes();
+            $this->state->file_id = $stream->state->file_id;
+            $this->state->output_bytes = $stream->state->output_bytes;
             return true;
         }
 
-        if($stream->get_last_error()) {
-            $this->controller->set_last_error($stream->get_last_error());
+        if($stream->state->last_error) {
+            $this->state->last_error = $stream->state->last_error;
         }
         return false;
     }
@@ -231,7 +216,7 @@ class Demultiplexer extends Byte_Stream {
         if($context) {
             $chunk_key = [];
             foreach($context as $k=>$stream) {
-                $chunk_key[] = $stream->controller->get_file_id();
+                $chunk_key[] = $stream->state->file_id;
             }
             $chunk_key = implode(':', $chunk_key);
         }
@@ -242,16 +227,16 @@ class Demultiplexer extends Byte_Stream {
             $this->streams[$chunk_key] = $create();
         }
         $stream = $this->streams[$chunk_key];
-        $stream->controller->append_bytes($data, $context);
+        $stream->append_bytes($data, $context);
         $this->last_stream = $stream;
         return true;
     }
 
     protected function finish()
     {
-        $this->controller->finish();
+        $this->state->finish();
         foreach($this->streams as $stream) {
-            $stream->controller->finish();
+            $stream->state->finish();
         }        
     }
 }
@@ -306,13 +291,13 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
      * metadata and exposes methods like skip_file().
      */
     protected function tick(): bool {
-        if($this->last_stream->controller->is_output_eof()) {
-            $this->controller->finish();
+        if($this->last_stream->is_eof()) {
+            $this->state->finish();
             return false;
         }
 
         while(true) {
-            $bytes = $this->controller->consume_input_bytes();
+            $bytes = $this->state->consume_input_bytes();
             if(null === $bytes || false === $bytes) {
                 break;
             }
@@ -321,8 +306,8 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             );
         }
 
-        if($this->controller->is_output_eof()) {
-            $this->first_stream->controller->input_eof();
+        if($this->is_eof()) {
+            $this->first_stream->state->append_eof();
         }
 
         if(empty($this->execution_stack)) {
@@ -333,7 +318,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             // Unpeel the context stack until we find a stream that
             // produces output.
             $stream = $this->pop_stream();
-            if ($stream->controller->is_output_eof()) {
+            if ($stream->is_eof()) {
                 continue;
             }
 
@@ -348,12 +333,12 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             $prev_stream = $stream;
             for ($i = count($this->execution_stack); $i < count($this->streams_names); $i++) {
                 $next_stream = $this->streams[$this->streams_names[$i]];
-                if($prev_stream->controller->is_output_eof()) {
-                    $next_stream->controller->input_eof();
+                if($prev_stream->is_eof()) {
+                    $next_stream->state->append_eof();
                 }
 
                 $next_stream->append_bytes(
-                    $prev_stream->controller->output_bytes,
+                    $prev_stream->state->output_bytes,
                     $this->tick_context
                 );
                 if (true !== $this->stream_next($next_stream)) {
@@ -365,12 +350,12 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 
             // When the last process in the chain produces output,
             // we write it to the output pipe and bale.
-            if($this->last_stream->controller->is_output_eof()) {
-                $this->controller->finish();
+            if($this->last_stream->is_eof()) {
+                $this->state->finish();
                 break;
             }
-            $this->controller->file_id = $this->last_stream->controller->get_file_id();
-            $this->controller->output_bytes = $this->last_stream->get_bytes();
+            $this->state->file_id = $this->last_stream->state->file_id;
+            $this->state->output_bytes = $this->last_stream->state->output_bytes;
 
             ++$this->chunk_nb;
             return true;
@@ -378,7 +363,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 
         // We produced no output and the upstream pipe is EOF.
         // We're done.
-        if($this->first_stream->controller->is_output_eof()) {
+        if($this->first_stream->is_eof()) {
             $this->finish();
         }
 
@@ -387,9 +372,9 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 
     protected function finish()
     {
-        $this->controller->finish();
+        $this->state->finish();
         foreach($this->streams as $stream) {
-            $stream->controller->finish();
+            $stream->state->finish();
         }        
     }
 
@@ -397,7 +382,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     {
         $name = $this->streams_names[count($this->execution_stack) - 1];
         unset($this->tick_context[$name]);
-        return array_pop($this->execution_stack);        
+        return array_pop($this->execution_stack);
     }
 
     private function push_stream(Byte_Stream $stream)
@@ -419,9 +404,9 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 
     private function handle_errors(Byte_Stream $stream)
     {
-        if($stream->controller->get_last_error()) {
+        if($stream->state->last_error) {
             $name = array_search($stream, $this->streams);
-            $this->controller->set_last_error("Process $name has crashed");
+            $this->state->last_error = "Process $name has crashed (" . $stream->state->last_error . ")";
         }
     }
 
@@ -454,10 +439,10 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 	public function next(): void {
         ++$this->chunk_nb;
 		while(!$this->next_bytes()) {
-            if($this->should_iterate_errors && $this->controller->get_last_error()) {
+            if($this->should_iterate_errors && $this->state->last_error) {
                 break;
             }
-            if($this->controller->is_output_eof()) {
+            if($this->is_eof()) {
                 break;
             }
 			usleep(10000);
@@ -465,7 +450,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 	}
 
 	public function valid(): bool {
-		return !$this->controller->is_output_eof() || ($this->should_iterate_errors && $this->controller->get_last_error());
+		return !$this->is_eof() || ($this->should_iterate_errors && $this->state->last_error);
 	}
 
 
@@ -498,8 +483,8 @@ class XML_Processor
         return new Demultiplexer(function () {
             $xml_processor = new WP_XML_Processor('', [], WP_XML_Processor::IN_PROLOG_CONTEXT);
             $node_visitor_callback = function () {};
-            return new ProcessorByteStream($xml_processor, function (ByteStreamController $controller) use ($xml_processor, $node_visitor_callback) {
-                $new_bytes = $controller->consume_input_bytes();
+            return new ProcessorByteStream($xml_processor, function (ByteStreamState $state) use ($xml_processor, $node_visitor_callback) {
+                $new_bytes = $state->consume_input_bytes();
                 if (null !== $new_bytes) {
                     $xml_processor->append_bytes($new_bytes);
                 }
@@ -521,14 +506,14 @@ class XML_Processor
                     // We've reached the end of the document, let's finish up.
                     // @TODO: Fix this so it doesn't return the entire XML
                     $buffer .= $xml_processor->get_unprocessed_xml();
-                    $controller->finish();
+                    $state->finish();
                 }
 
                 if (!strlen($buffer)) {
                     return false;
                 }
 
-                $controller->output_bytes = $buffer;
+                $state->output_bytes = $buffer;
                 return true;
             });
         });
@@ -542,22 +527,22 @@ class HTTP_Client
     {
         $client = new Client();
         $client->enqueue($requests);
-        return new Byte_Stream(function (ByteStreamController $controller) use ($client) {
+        return new Byte_Stream(function (ByteStreamState $state) use ($client) {
             $request = null;
             while ($client->await_next_event()) {
                 $request = $client->get_request();
                 switch ($client->get_event()) {
                     case Client::EVENT_BODY_CHUNK_AVAILABLE:
-                        $controller->file_id = $request->id;
-                        $controller->output_bytes = $client->get_response_body_chunk();
+                        $state->file_id = $request->id;
+                        $state->output_bytes = $client->get_response_body_chunk();
                         return true;
                     case Client::EVENT_FAILED:
-                        $controller->set_last_error('Request failed: ' . $request->error);
+                        $state->last_error = 'Request failed: ' . $request->error;
                         break;
                 }
             }
 
-            $controller->finish();
+            $state->finish();
             return false;
         });
     }
@@ -570,8 +555,8 @@ class ZIP_Processor
     {
         return new Demultiplexer(function () {
             $zip_reader = new ZipStreamReader('');
-            return new ProcessorByteStream($zip_reader, function (ByteStreamController $controller) use ($zip_reader) {
-                $new_bytes = $controller->consume_input_bytes();
+            return new ProcessorByteStream($zip_reader, function (ByteStreamState $state) use ($zip_reader) {
+                $new_bytes = $state->consume_input_bytes();
                 if (null !== $new_bytes) {
                     $zip_reader->append_bytes($new_bytes);
                 }
@@ -579,8 +564,8 @@ class ZIP_Processor
                 while ($zip_reader->next()) {
                     switch ($zip_reader->get_state()) {
                         case ZipStreamReader::STATE_FILE_ENTRY:
-                            $controller->file_id = $zip_reader->get_file_path();
-                            $controller->output_bytes = $zip_reader->get_file_body_chunk();
+                            $state->file_id = $zip_reader->get_file_path();
+                            $state->output_bytes = $zip_reader->get_file_body_chunk();
                             return true;
                     }
                 }
