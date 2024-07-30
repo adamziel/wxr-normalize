@@ -7,8 +7,8 @@
  *   I only used it to make the development easier, I got confused with the other attempt in
  *   `pipes.php` and this kept me on track. However, keeping these names will likely confuse others.
  * * ✅ Explore merging Pipes and Processes into a single concept after all.
- *      Not doing that is nice, too. Writing to stdout is not equivalent to
- *      starting more computation downstream. Reading from stdin is not equivalent
+ *      Not doing that is nice, too. Writing to output is not equivalent to
+ *      starting more computation downstream. Reading from input is not equivalent
  *      to trigerring more computations upstream. We get a buffer, a demilitarized
  *      zone between processes. Perhaps that's what was missing from the other experiment.
  * * ✅ Make ProcessChain implement the Iterator interface. Iterator semantics doesn't make
@@ -20,7 +20,7 @@
  *       $context['zip'] wouldn't be an abstract metadata array, but the actual ZipStreamReader instance
  *       with all the methods and properties available.
  *     ^ Problem is, we want the next stream to have access to the metadata.
- *     ^ Well, writing metadata to stdout is the same as coupling it with the stream instance.
+ *     ^ Well, writing metadata to output is the same as coupling it with the stream instance.
  *       Also, since we'll need to access the metadata later, even after it's been written to the next
  *       stream, we may need to keep the Pipe class around.
  *   * Not writing bytes to a pipe but writing a new Chunk($bytes, $metadata) object to tightly couple the two
@@ -48,11 +48,11 @@
  *         handy to force that on every process.
  *       * But still, could we have a ProcessPipe class? And a PipeProcess class?
  *       * Every Process needs a way to receive more data, emit its data, and emit errors.
- *         Currently we assume a tick() call that does $stdin->read(). We could have a public
+ *         Currently we assume a tick() call that does $input->read(). We could have a public
  *         Process::write() method 
  *    ^ MultiplexedPipe isn't used anymore
- * * ✅ The process `do_tick` method typically checks for `stdin->is_eof()` and then
- *      whether `stdin->read()` is valid. Can we simplify this boilerplate somehow?
+ * * ✅ The process `do_tick` method typically checks for `input->is_eof()` and then
+ *      whether `input->read()` is valid. Can we simplify this boilerplate somehow?
  *      ^ the BufferProcessor interface solves that problem.
  * * ✅ Explore a shared "Streamable" interface for all stream processors (HTML, XML, ZIP, HTTP, etc.)
  *      ^ Would the "Process" have the same interface? A `tick()` seems isomorphic to
@@ -63,8 +63,8 @@
  *         with `read()` and `write($bytes, $metadata)` methods seems to be a good fit for XML, ZIP, HTTP.
  *         It resembles a Pipe interface, too. I wonder if these "Process" classes could be pipes themselves.
  * * ✅ Get rid of ProcessManager
- * * ✅ Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
- *      Let's keep stderr after all.
+ * * ✅ Get rid of errors. We don't need it to be a stream. A single $error field + bubbling should do.
+ *      Let's keep errors after all.
  * * ✅ Remove these methods: set_write_sequence, ensure_output_sequence, add_output_sequence, close_output_sequence
  * * ✅ Declare `bool` return type everywhere where it's missing. We may even remove it later for PHP BC,
  *      but let's still add it for a moment just to make sure we're not missing any typed return.
@@ -84,8 +84,8 @@
  *   bit me a few times when I was in a context where I could not call read() first because,
  *   e.g. another process was about to do that. Maybe this is a good thing, as it forces us
  *   to split a pipe in two whenever an intermediate read is involved, e.g. Process A wouldn't
- *   just connect it's stdin to a subprocess A.1, but it would read from stdin, read metadata,
- *   do processing, ant only then write to A.1 stdin. Still, a better error reporting wouldn't hurt.
+ *   just connect it's input to a subprocess A.1, but it would read from input, read metadata,
+ *   do processing, ant only then write to A.1 input. Still, a better error reporting wouldn't hurt.
  */
 
 /**
@@ -107,14 +107,14 @@
  * about the open-ness or EOF-ness of its input and output pipes,
  * not about the actual lifecycle of the other processes.
  * 
- * However, we may want to correlate the same stream ID with stdout and
- * stderr streams, in which case intertwining stream ID and process ID
+ * However, we may want to correlate the same stream ID with output and
+ * errors streams, in which case intertwining stream ID and process ID
  * would be useful. But then we don't have a 1:1 mapping between
  * what a data stream does and what a process does.
  * 
  * Let's try these two approach and see where we get with it:
  * 
- * 1. Each process has a multiplexed stdin, stdout, and stderr pipes.
+ * 1. Each process has a multiplexed input, output, and errors pipes.
  *    We do not use non-multiplexed pipes at all. Every process communicates
  *    "there will be more output to come" by keeping at least one output
  *    pipe open. Each process makes sure to react to sub-pipe state changes.
@@ -131,26 +131,26 @@
 
 
 /**
- * ## Get rid of stderr. We don't need it to be a stream. A single $error field + bubbling should do.
+ * ## Get rid of errors. We don't need it to be a stream. A single $error field + bubbling should do.
  * 
- * Maybe stderr is fine after all? I'm no longer convinced about inventing a separate mechanism
- * for error propagation. We'd have to implement a lot of the same features that stderr already
+ * Maybe errors is fine after all? I'm no longer convinced about inventing a separate mechanism
+ * for error propagation. We'd have to implement a lot of the same features that errors already
  * have.
  * 
- * Advantages of using stderr for propagating errors:
+ * Advantages of using errors for propagating errors:
  * 
  * * We can bubble up multiple errors from a single process.
  * * They have metadata attached and are traceable to a specific process.
- * * Piping to stderr doesn't imply the entire process have crashed, which we
+ * * Piping to errors doesn't imply the entire process have crashed, which we
  *   wouldn't want in case of, say, Demultiplexer.
- * * We clearly know when the errors are done, as stderr is a stream and we know
+ * * We clearly know when the errors are done, as errors is a stream and we know
  *   when it's EOF.
- * * We can put any pipe in place of stderr, e.g. a generic logger pipe
+ * * We can put any pipe in place of errors, e.g. a generic logger pipe
  * 
  * Disadvantages:
  * 
  * * Pipes have more features than error propagation uses, e.g. we rarely care
- *   for is_eof() on stderr, but we still have to close that errors pipe.
+ *   for is_eof() on errors, but we still have to close that errors pipe.
  */
 
 use WordPress\AsyncHttp\Client;
@@ -159,15 +159,15 @@ use WordPress\AsyncHttp\Request;
 abstract class Process implements ArrayAccess {
     private ?int $exit_code = null;
     private bool $is_reaped = false;
-    protected Pipe $stdin;
-    protected Pipe $stdout;
-    protected Pipe $stderr;
+    protected Pipe $input;
+    protected Pipe $output;
+    protected Pipe $errors;
 
-    public function __construct($stdin=null, $stdout=null, $stderr=null)
+    public function __construct($input=null, $output=null, $errors=null)
     {
-        $this->stdin = $stdin ?? new BufferPipe();
-        $this->stdout = $stdout ?? new BufferPipe();
-        $this->stderr = $stderr ?? new BufferPipe();
+        $this->input = $input ?? new BufferPipe();
+        $this->output = $output ?? new BufferPipe();
+        $this->errors = $errors ?? new BufferPipe();
     }
 
     public function run()
@@ -189,9 +189,9 @@ abstract class Process implements ArrayAccess {
 
     public function kill($code) {
         $this->exit_code = $code;
-        $this->stdin->close();
-        $this->stdout->close();
-        $this->stderr->close();
+        $this->input->close();
+        $this->output->close();
+        $this->errors->close();
     }
 
     public function reap(): bool
@@ -228,11 +228,11 @@ abstract class Process implements ArrayAccess {
 
 
     public function offsetExists($offset): bool {
-        return isset($this->stdout->get_metadata()[$offset]);
+        return isset($this->output->get_metadata()[$offset]);
     }
 
     public function offsetGet($offset): mixed {
-        return $this->stdout->get_metadata()[$offset] ?? null;
+        return $this->output->get_metadata()[$offset] ?? null;
     }
 
     public function offsetSet($offset, $value): void {
@@ -253,16 +253,16 @@ abstract class BufferProcessor extends Process
             return true;
         }
 
-        if (!$this->stdin->read()) {
-            if ($this->stdin->is_eof()) {
+        if (!$this->input->read()) {
+            if ($this->input->is_eof()) {
                 $this->kill(0);
             }
             return false;
         }
 
         $this->write(
-            $this->stdin->consume_bytes(),
-            $this->stdin->get_metadata(),
+            $this->input->consume_bytes(),
+            $this->input->get_metadata(),
             $tick_context
         );
 
@@ -297,7 +297,7 @@ abstract class TransformProcess extends BufferProcessor {
             return false;
         }
 
-        $this->stdout->write($transformed, $this->metadata);
+        $this->output->write($transformed, $this->metadata);
         return true;
     }
 
@@ -600,7 +600,7 @@ class Demultiplexer extends BufferProcessor {
         }
 
         $subprocess = $this->subprocesses[$chunk_key];
-        $subprocess->stdin->write($next_chunk, $metadata);
+        $subprocess->input->write($next_chunk, $metadata);
         $this->last_subprocess = $subprocess;
     }
 
@@ -615,19 +615,19 @@ class Demultiplexer extends BufferProcessor {
             return false;
         }
     
-        if ($subprocess->stdout->read()) {
-            $output = $subprocess->stdout->consume_bytes();
+        if ($subprocess->output->read()) {
+            $output = $subprocess->output->consume_bytes();
             $chunk_metadata = array_merge(
                 [$this->key => $this->last_input_key],
-                $subprocess->stdout->get_metadata() ?? [],
+                $subprocess->output->get_metadata() ?? [],
             );
-            $this->stdout->write($output, $chunk_metadata);
+            $this->output->write($output, $chunk_metadata);
             return true;
         }
 
         if (!$subprocess->is_alive()) {
             if ($subprocess->has_crashed()) {
-                $this->stderr->write(
+                $this->errors->write(
                     "Subprocess $this->last_input_key has crashed with code {$subprocess->exit_code}",
                     [
                         'type' => 'crash',
@@ -688,7 +688,7 @@ class ZipReaderProcess extends BufferProcessor {
                     if ($this->last_skipped_file === $file_path) {
                         break;
                     }
-                    $this->stdout->write($this->reader->get_file_body_chunk(), [
+                    $this->output->write($this->reader->get_file_body_chunk(), [
                         'file_id' => $file_path,
                         // Use a separate sequence for each file so the next
                         // process may separate the files.
@@ -711,8 +711,8 @@ class ProcessChain extends Process implements Iterator {
     private $execution_stack = [];
     private $tick_context = [];
 
-    public function __construct($process_factories, $stdin=null, $stdout=null, $stderr=null) {
-        parent::__construct($stdin, $stdout, $stderr);
+    public function __construct($process_factories, $input=null, $output=null, $errors=null) {
+        parent::__construct($input, $output, $errors);
 
         $last_process = null;
         $this->subprocesses_names = array_keys($process_factories);
@@ -725,7 +725,7 @@ class ProcessChain extends Process implements Iterator {
             $factory = $processes[$i];
             $subprocess = $factory();
             if(null !== $last_process) {
-                $subprocess->stdin = $last_process->stdout;
+                $subprocess->input = $last_process->output;
             }
             $this->subprocesses[$this->subprocesses_names[$i]] = $subprocess;
             $last_process = $subprocess;
@@ -760,23 +760,23 @@ class ProcessChain extends Process implements Iterator {
      * metadata and exposes methods like skip_file().
      */
     protected function do_tick($tick_context): bool {
-        if($this->last_subprocess->stdout->is_eof()) {
+        if($this->last_subprocess->output->is_eof()) {
             $this->kill(0);
             return false;
         }
 
         while(true) {
-            if(true !== $this->stdin->read()) {
+            if(true !== $this->input->read()) {
                 break;
             }
-            $this->first_subprocess->stdin->write(
-                $this->stdin->consume_bytes(),
-                $this->stdin->get_metadata()
+            $this->first_subprocess->input->write(
+                $this->input->consume_bytes(),
+                $this->input->get_metadata()
             );
         }
 
-        if($this->stdin->is_eof()) {
-            $this->first_subprocess->stdin->close();
+        if($this->input->is_eof()) {
+            $this->first_subprocess->input->close();
         }
 
         if(empty($this->execution_stack)) {
@@ -787,7 +787,7 @@ class ProcessChain extends Process implements Iterator {
             // Unpeel the context stack until we find a process that
             // produces output.
             $process = $this->pop_process();
-            if ($process->stdout->is_eof()) {
+            if ($process->output->is_eof()) {
                 continue;
             }
 
@@ -808,12 +808,12 @@ class ProcessChain extends Process implements Iterator {
             }
 
             // When the last process in the chain produces output,
-            // we write it to the stdout pipe and bale.
-            if(true !== $this->last_subprocess->stdout->read()) {
+            // we write it to the output pipe and bale.
+            if(true !== $this->last_subprocess->output->read()) {
                 break;
             }
-            $this->stdout->write(
-                $this->last_subprocess->stdout->consume_bytes(),
+            $this->output->write(
+                $this->last_subprocess->output->consume_bytes(),
                 $this->tick_context
             );
             ++$this->chunk_nb;
@@ -855,11 +855,11 @@ class ProcessChain extends Process implements Iterator {
 
     private function handle_errors($process)
     {
-        while ($process->stderr->read()) {
-            $this->stderr->write($process->stderr->consume_bytes(), [
+        while ($process->errors->read()) {
+            $this->errors->write($process->errors->consume_bytes(), [
                 'type' => 'error',
                 'process' => $process,
-                ...($process->stderr->get_metadata() ?? []),
+                ...($process->errors->get_metadata() ?? []),
             ]);
         }
 
@@ -867,7 +867,7 @@ class ProcessChain extends Process implements Iterator {
             if (!$process->is_reaped()) {
                 $process->reap();
                 $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
-                $this->stderr->write("Process $name has crashed with code {$process->exit_code}", [
+                $this->errors->write("Process $name has crashed with code {$process->exit_code}", [
                     'type' => 'crash',
                     'process' => $process,
                     'reaped' => true,
@@ -884,7 +884,7 @@ class ProcessChain extends Process implements Iterator {
     private $chunk_nb = -1;
 	public function current(): mixed {
 		if(null === $this->iterator_output_cache) {
-			$this->iterator_output_cache = $this->stdout->consume_bytes();
+			$this->iterator_output_cache = $this->output->consume_bytes();
 		}
 		return $this->iterator_output_cache;
 	}
@@ -938,7 +938,6 @@ class HttpClientProcess extends Process {
 	private $requests = [];
 	private $child_contexts = [];
 	private $skipped_requests = [];
-	private $errors = [];
 
     static public function stream($requests) {
         return fn () => new HttpClientProcess($requests);
@@ -958,14 +957,14 @@ class HttpClientProcess extends Process {
             $output_sequence = 'request_' . $request->id;
             switch ($this->client->get_event()) {
                 case Client::EVENT_BODY_CHUNK_AVAILABLE:
-                    $this->stdout->write($this->client->get_response_body_chunk(), [
+                    $this->output->write($this->client->get_response_body_chunk(), [
                         'sequence' => $output_sequence,
                         'request' => $request
                     ]);
                     return true;
 
                 case Client::EVENT_FAILED:
-                    $this->stderr->write('Request failed: ' . $request->error, [
+                    $this->errors->write('Request failed: ' . $request->error, [
                         'request' => $request
                     ]);
                     break;
@@ -1013,7 +1012,7 @@ class XMLProcess extends BufferProcessor {
 
 		if ( $this->xml_processor->get_last_error() ) {
             $this->kill(1);
-			$this->stderr->write( $this->xml_processor->get_last_error() );
+			$this->errors->write( $this->xml_processor->get_last_error() );
 			return false;
 		}
 
@@ -1041,7 +1040,7 @@ class XMLProcess extends BufferProcessor {
             return false;
         }
 
-        $this->stdout->write($buffer);
+        $this->output->write($buffer);
 
         return true;
     }
@@ -1120,18 +1119,18 @@ foreach($process as $k => $chunk) {
 
 function log_process_chain_errors($process) {
     return;
-    if(!($process->stderr instanceof BufferPipe)) {
+    if(!($process->errors instanceof BufferPipe)) {
         return;
     }
     
-    $error = $process->stderr->read();
+    $error = $process->errors->read();
     if ($error) {
         echo 'Error: ' . $error . "\n";
-        $meta = $process->stderr->get_metadata();
+        $meta = $process->errors->get_metadata();
         if ($meta['type'] ?? '' === 'crash') {
-            $child_error = $meta['process']->stderr->read();
+            $child_error = $meta['process']->errors->read();
             if ($child_error) {
-                echo 'CRASH: ' . $meta['process']->stderr->read() . "\n";
+                echo 'CRASH: ' . $meta['process']->errors->read() . "\n";
             }
         }
     }    
