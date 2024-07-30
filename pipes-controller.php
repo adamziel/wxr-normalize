@@ -100,7 +100,13 @@ class ProcessorByteStream extends Byte_Stream
     public function __construct($processor, $callback)
     {
         $this->processor = $processor;
-        parent::__construct($callback);
+        parent::__construct(function($state) use($processor, $callback) {
+            $new_bytes = $state->consume_input_bytes();
+            if (null !== $new_bytes) {
+                $processor->append_bytes($new_bytes);
+            }
+            return $callback($state);
+        });
     }
 }
 
@@ -478,17 +484,11 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 // Imagine this method is implemented in the WP_XML_Processor
 class XML_Processor
 {
-    static public function stream()
+    static public function stream($node_visitor_callback)
     {
-        return new Demultiplexer(function () {
+        return new Demultiplexer(function () use ($node_visitor_callback) {
             $xml_processor = new WP_XML_Processor('', [], WP_XML_Processor::IN_PROLOG_CONTEXT);
-            $node_visitor_callback = function () {};
             return new ProcessorByteStream($xml_processor, function (ByteStreamState $state) use ($xml_processor, $node_visitor_callback) {
-                $new_bytes = $state->consume_input_bytes();
-                if (null !== $new_bytes) {
-                    $xml_processor->append_bytes($new_bytes);
-                }
-
                 $tokens_found = 0;
                 while ($xml_processor->next_token()) {
                     ++$tokens_found;
@@ -556,11 +556,6 @@ class ZIP_Processor
         return new Demultiplexer(function () {
             $zip_reader = new ZipStreamReader('');
             return new ProcessorByteStream($zip_reader, function (ByteStreamState $state) use ($zip_reader) {
-                $new_bytes = $state->consume_input_bytes();
-                if (null !== $new_bytes) {
-                    $zip_reader->append_bytes($new_bytes);
-                }
-
                 while ($zip_reader->next()) {
                     switch ($zip_reader->get_state()) {
                         case ZipStreamReader::STATE_FILE_ENTRY:
@@ -569,7 +564,6 @@ class ZIP_Processor
                             return true;
                     }
                 }
-
                 return false;
             });
         });
@@ -592,7 +586,7 @@ $chain = new StreamChain(
             }
             return $bytes;
         }),
-        'xml' => XML_Processor::stream(),
+        'xml' => XML_Processor::stream(function () { }),
         Byte_Stream::map(function($bytes) { return strtoupper($bytes); }),
     ]
 );
