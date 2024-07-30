@@ -829,6 +829,9 @@ class ProcessChain extends Process implements Iterator {
     {
         array_push($this->execution_stack, $process);
         $name = $this->subprocesses_names[count($this->execution_stack) - 1];
+        if($process instanceof Demultiplexer) {
+            $process = $process->get_subprocess();
+        }
         $this->tick_context[$name] = $process;
     }
 
@@ -1089,7 +1092,7 @@ $process = new ProcessChain([
             $context['zip']->skip_file('export.wxr');
             return null;
         }
-        print_r($context['zip']->get_subprocess()->get_zip_reader()->get_header());
+        print_r($context['zip']->get_zip_reader()->get_header());
         return $data;
     }),
     'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
