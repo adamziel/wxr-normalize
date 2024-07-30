@@ -157,7 +157,13 @@ use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
 abstract class Process implements ArrayAccess {
-    private ?int $exit_code = null;
+
+    const STATE_STREAMING = '#streaming';
+    const STATE_FINISHED = '#finished';
+    const STATE_CRASHED = '#crashed';
+
+    private string $state = self::STATE_STREAMING;
+
     protected Pipe $input;
     protected Pipe $output;
     protected Pipe $errors;
@@ -179,31 +185,34 @@ abstract class Process implements ArrayAccess {
 
     abstract protected function do_tick($tick_context): bool;
 
-    public function kill($code) {
-        $this->exit_code = $code;
-        $this->input->close();
-        $this->output->close();
-        $this->errors->close();
+    protected function crash( $error_message = null )
+    {
+        if($error_message) {
+            $this->errors->write( $error_message );
+        }
+        $this->state = self::STATE_CRASHED;
         $this->cleanup();
     }
 
+    protected function finish() {
+        $this->state = self::STATE_FINISHED;
+        $this->cleanup();
+    }
+
+    protected function cleanup()
+    {
+        $this->input->close();
+        $this->output->close();
+        $this->errors->close();
+    }
+
     public function has_crashed(): bool {
-        return $this->exit_code !== null && $this->exit_code !== 0;
+        return $this->state === self::STATE_CRASHED;
     }
 
     public function is_alive(): bool {
-        return $this->exit_code === null;
+        return $this->state === self::STATE_STREAMING;
     }
-
-    protected function cleanup() {
-        // clean up resources
-    }
-
-    public function skip_file($file_id) {
-        // Needs to be implemented by subclasses
-        return false;
-    }
-
 
     public function offsetExists($offset): bool {
         return isset($this->output->get_metadata()[$offset]);
@@ -233,7 +242,7 @@ abstract class BufferProcessor extends Process
 
         if (!$this->input->read()) {
             if ($this->input->is_eof()) {
-                $this->kill(0);
+                $this->finish();
             }
             return false;
         }
@@ -606,7 +615,7 @@ class Demultiplexer extends BufferProcessor {
         if (!$subprocess->is_alive()) {
             if ($subprocess->has_crashed()) {
                 $this->errors->write(
-                    "Subprocess $this->last_input_key has crashed with code {$subprocess->exit_code}",
+                    "Subprocess $this->last_input_key has crashed",
                     [
                         'type' => 'crash',
                         'process' => $subprocess,
@@ -739,7 +748,7 @@ class ProcessChain extends Process implements Iterator {
      */
     protected function do_tick($tick_context): bool {
         if($this->last_subprocess->output->is_eof()) {
-            $this->kill(0);
+            $this->finish();
             return false;
         }
 
@@ -801,7 +810,7 @@ class ProcessChain extends Process implements Iterator {
         // We produced no output and the upstream pipe is EOF.
         // We're done.
         if(!$this->first_subprocess->is_alive()) {
-            $this->kill(0);
+            $this->finish();
         }
 
         return false;
@@ -833,23 +842,21 @@ class ProcessChain extends Process implements Iterator {
 
     private function handle_errors($process)
     {
-        while ($process->errors->read()) {
-            $this->errors->write($process->errors->consume_bytes(), [
-                'type' => 'error',
-                'process' => $process,
-                ...($process->errors->get_metadata() ?? []),
-            ]);
-        }
-
         if($process->has_crashed()) {
             $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
             if(!isset($this->reaped_subprocesses[$name])) {
-                $this->errors->write("Process $name has crashed with code {$process->exit_code}", [
+                $this->errors->write("Process $name has crashed", [
                     'type' => 'crash',
                     'process' => $process,
                 ]);
                 $this->reaped_subprocesses[$name] = true;
             }
+        } else if ($process->errors->read()) {
+            $this->errors->write($process->errors->consume_bytes(), [
+                'type' => 'error',
+                'process' => $process,
+                ...($process->errors->get_metadata() ?? []),
+            ]);
         }
     }
 
@@ -948,7 +955,7 @@ class HttpClientProcess extends Process {
             }
         }
 
-        $this->kill(0);
+        $this->finish();
         return false;
 	}
 
@@ -988,8 +995,7 @@ class XMLProcess extends BufferProcessor {
         }
 
 		if ( $this->xml_processor->get_last_error() ) {
-            $this->kill(1);
-			$this->errors->write( $this->xml_processor->get_last_error() );
+            $this->crash( $this->xml_processor->get_last_error() );
 			return false;
 		}
 
@@ -1010,7 +1016,7 @@ class XMLProcess extends BufferProcessor {
         ) {
             // We've reached the end of the document, let's finish up.
 			$buffer .= $this->xml_processor->get_unprocessed_xml();
-            $this->kill(0);
+            $this->finish();
 		}
 
         if(!strlen($buffer)) {
