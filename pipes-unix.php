@@ -533,7 +533,7 @@ class MultiplexingPipe implements Pipe {
 class CallbackStream extends TransformerStream {
     private $callback;
     
-    static public function stream($callback) {
+    static public function factory($callback) {
         return fn () => new static($callback);
     }
 
@@ -549,7 +549,7 @@ class CallbackStream extends TransformerStream {
 }
 
 class Demultiplexer extends BufferStream {
-    private $process_factory = [];
+    private $stream_factory = [];
     private $subprocesses = [];
     private $killed_subprocesses = [];
     private $demux_queue = [];
@@ -557,8 +557,8 @@ class Demultiplexer extends BufferStream {
     private $last_input_key;
     private $key;
     
-    public function __construct($process_factory, $key = 'sequence') {
-        $this->process_factory = $process_factory;
+    public function __construct($stream_factory, $key = 'sequence') {
+        $this->stream_factory = $stream_factory;
         $this->key = $key;
         parent::__construct();
     }
@@ -572,7 +572,7 @@ class Demultiplexer extends BufferStream {
         $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
         $this->last_input_key = $chunk_key;
         if (!isset($this->subprocesses[$chunk_key])) {
-            $factory = $this->process_factory;
+            $factory = $this->stream_factory;
             $this->subprocesses[$chunk_key] = $factory();
         }
 
@@ -633,7 +633,7 @@ class ZipReader extends BufferStream {
     private $reader;
     private $last_skipped_file = null;
 
-    static public function stream() {
+    static public function factory() {
         return fn () => new Demultiplexer(fn() => new ZipReader());
     }
 
@@ -682,34 +682,34 @@ class ZipReader extends BufferStream {
 class StreamChain extends Stream implements Iterator {
     private $first_subprocess;
     private $last_subprocess;
-    private $subprocesses = [];
-    private $subprocesses_names = [];
-    private $reaped_subprocesses = [];
+    private $streams = [];
+    private $streams_names = [];
+    private $finished_streams = [];
     private $execution_stack = [];
     private $tick_context = [];
 
-    public function __construct($process_factories, $input=null, $output=null, $errors=null) {
+    public function __construct($streams_factories, $input=null, $output=null, $errors=null) {
         parent::__construct($input, $output, $errors);
 
         $last_process = null;
-        $this->subprocesses_names = array_keys($process_factories);
-        foreach($this->subprocesses_names as $k => $name) {
-            $this->subprocesses_names[$k] = $name . '';
+        $this->streams_names = array_keys($streams_factories);
+        foreach($this->streams_names as $k => $name) {
+            $this->streams_names[$k] = $name . '';
         }
 
-        $processes = array_values($process_factories);
-        for($i = 0; $i < count($process_factories); $i++) {
-            $factory = $processes[$i];
+        $streams = array_values($streams_factories);
+        for($i = 0; $i < count($streams_factories); $i++) {
+            $factory = $streams[$i];
             $subprocess = $factory();
             if(null !== $last_process) {
                 $subprocess->input = $last_process->output;
             }
-            $this->subprocesses[$this->subprocesses_names[$i]] = $subprocess;
+            $this->streams[$this->streams_names[$i]] = $subprocess;
             $last_process = $subprocess;
         }
 
-        $this->first_subprocess = $this->subprocesses[$this->subprocesses_names[0]];
-        $this->last_subprocess = $this->subprocesses[$this->subprocesses_names[count($process_factories) - 1]];
+        $this->first_subprocess = $this->streams[$this->streams_names[0]];
+        $this->last_subprocess = $this->streams[$this->streams_names[count($streams_factories) - 1]];
     }
 
     /**
@@ -761,27 +761,27 @@ class StreamChain extends Stream implements Iterator {
         }
 
         while (count($this->execution_stack)) {
-            // Unpeel the context stack until we find a process that
+            // Unpeel the context stack until we find a stream that
             // produces output.
-            $process = $this->pop_process();
-            if ($process->output->is_eof()) {
+            $stream = $this->pop_stream();
+            if ($stream->output->is_eof()) {
                 continue;
             }
 
-            if(true !== $this->tick_subprocess($process)) {
+            if(true !== $this->tick_stream($stream)) {
                 continue;
             }
 
             // We've got output from the process, yay! Let's
             // propagate it downstream.
-            $this->push_process($process);
+            $this->push_stream($stream);
 
-            for ($i = count($this->execution_stack); $i < count($this->subprocesses_names); $i++) {
-                $next_process = $this->subprocesses[$this->subprocesses_names[$i]];
-                if (true !== $this->tick_subprocess($next_process)) {
+            for ($i = count($this->execution_stack); $i < count($this->streams_names); $i++) {
+                $next_process = $this->streams[$this->streams_names[$i]];
+                if (true !== $this->tick_stream($next_process)) {
                     break;
                 }
-                $this->push_process($next_process);
+                $this->push_stream($next_process);
             }
 
             // When the last process in the chain produces output,
@@ -806,46 +806,46 @@ class StreamChain extends Stream implements Iterator {
         return false;
     }
 
-    private function pop_process()
+    private function pop_stream()
     {
-        $name = $this->subprocesses_names[count($this->execution_stack) - 1];
+        $name = $this->streams_names[count($this->execution_stack) - 1];
         unset($this->tick_context[$name]);
         return array_pop($this->execution_stack);        
     }
 
-    private function push_process($process)
+    private function push_stream($stream)
     {
-        array_push($this->execution_stack, $process);
-        $name = $this->subprocesses_names[count($this->execution_stack) - 1];
-        if($process instanceof Demultiplexer) {
-            $process = $process->get_subprocess();
+        array_push($this->execution_stack, $stream);
+        $name = $this->streams_names[count($this->execution_stack) - 1];
+        if($stream instanceof Demultiplexer) {
+            $stream = $stream->get_subprocess();
         }
-        $this->tick_context[$name] = $process;
+        $this->tick_context[$name] = $stream;
     }
 
-    private function tick_subprocess($process)
+    private function tick_stream($stream)
     {
-        $produced_output = $process->tick($this->tick_context);
-        $this->handle_errors($process);
+        $produced_output = $stream->tick($this->tick_context);
+        $this->handle_errors($stream);
         return $produced_output;
     }
 
-    private function handle_errors($process)
+    private function handle_errors($stream)
     {
-        if($process->has_crashed()) {
-            $name = $this->subprocesses_names[array_search($process, $this->subprocesses)];
-            if(!isset($this->reaped_subprocesses[$name])) {
+        if($stream->has_crashed()) {
+            $name = $this->streams_names[array_search($stream, $this->streams)];
+            if(!isset($this->finished_streams[$name])) {
                 $this->errors->write("Process $name has crashed", [
                     'type' => 'crash',
-                    'process' => $process,
+                    'process' => $stream,
                 ]);
-                $this->reaped_subprocesses[$name] = true;
+                $this->finished_streams[$name] = true;
             }
-        } else if ($process->errors->read()) {
-            $this->errors->write($process->errors->consume_bytes(), [
+        } else if ($stream->errors->read()) {
+            $this->errors->write($stream->errors->consume_bytes(), [
                 'type' => 'error',
-                'process' => $process,
-                ...($process->errors->get_metadata() ?? []),
+                'process' => $stream,
+                ...($stream->errors->get_metadata() ?? []),
             ]);
         }
     }
@@ -913,7 +913,7 @@ class HttpStream extends Stream {
 	private $child_contexts = [];
 	private $skipped_requests = [];
 
-    static public function stream($requests) {
+    static public function factory($requests) {
         return fn () => new HttpStream($requests);
     }
 
@@ -956,7 +956,7 @@ class XMLStream extends BufferStream {
 	private $xml_processor;
 	private $node_visitor_callback;
 
-    static public function stream($node_visitor_callback) {
+    static public function factory($node_visitor_callback) {
         return fn () => new Demultiplexer(fn () =>
             new XMLStream($node_visitor_callback)
         );
@@ -1052,15 +1052,15 @@ function is_wxr_content_node( WP_XML_Processor $processor ) {
 require __DIR__ . '/bootstrap.php';
 
 
-$process = new StreamChain(
+$stream = new StreamChain(
     [
-        HttpStream::stream([
+        HttpStream::factory([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
             // Bad request, will fail:
             new Request('http://127.0.0.1:9865'),
         ]),
-        'zip' => ZipReader::stream(),
-        CallbackStream::stream(function ($data, $context, $process) {
+        'zip' => ZipReader::factory(),
+        CallbackStream::factory(function ($data, $context) {
             if ($context['zip']['file_id'] !== 'export.wxr') {
                 $context['zip']->skip_file('export.wxr');
                 return null;
@@ -1068,7 +1068,7 @@ $process = new StreamChain(
             print_r($context['zip']->get_zip_reader()->get_header());
             return $data;
         }),
-        'xml' => XMLStream::stream(function (WP_XML_Processor $processor) {
+        'xml' => XMLStream::factory(function (WP_XML_Processor $processor) {
             if (is_wxr_content_node($processor)) {
                 $text = $processor->get_modifiable_text();
                 $updated_text = 'Hey there, what\'s up?';
@@ -1077,7 +1077,7 @@ $process = new StreamChain(
                 }
             }
         }),
-        CallbackStream::stream(function ($data, $context, $process) {
+        CallbackStream::factory(function ($data, $context) {
             return strtoupper($data);
         })
     ],
@@ -1086,10 +1086,10 @@ $process = new StreamChain(
     new FilePipe('php://stderr', 'w')
 );
 
-foreach($process as $k => $chunk) {
+foreach($stream as $k => $chunk) {
     var_dump([
         $k => $chunk,
-        'zip file_id' => $process['zip']['file_id']
+        'zip file_id' => $stream['zip']['file_id']
     ]);
 }
 
