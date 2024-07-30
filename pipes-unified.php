@@ -18,7 +18,7 @@ interface IByteStream {
     const STATE_STREAMING = '#streaming';
     const STATE_FINISHED = '#finished';
 
-    public function next_chunk(): bool;
+    public function next_bytes(): bool;
     public function input_eof();
     public function append_bytes(string $bytes, $context = null);
     public function is_output_eof(): bool;
@@ -61,7 +61,7 @@ abstract class ByteStream implements IByteStream {
         return $bytes;
     }
 
-    public function next_chunk(): bool
+    public function next_bytes(): bool
     {
         $this->output_bytes = null;
         $this->last_error = null;
@@ -273,7 +273,7 @@ class Demultiplexer extends ByteStream {
             return false;
         }
 
-        if($stream->next_chunk()) {
+        if($stream->next_bytes()) {
             $this->set_output_bytes($stream->get_bytes());
             return true;
         }
@@ -470,7 +470,7 @@ class StreamChain extends ByteStream implements ArrayAccess, Iterator {
 
     private function stream_next(IByteStream $stream)
     {
-        $produced_output = $stream->next_chunk();
+        $produced_output = $stream->next_bytes();
         $this->handle_errors($stream);
         return $produced_output;
     }
@@ -511,7 +511,7 @@ class StreamChain extends ByteStream implements ArrayAccess, Iterator {
 
 	public function next(): void {
         ++$this->chunk_nb;
-		while(!$this->next_chunk()) {
+		while(!$this->next_bytes()) {
             if($this->should_iterate_errors && $this->get_last_error()) {
                 break;
             }
