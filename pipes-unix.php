@@ -302,8 +302,8 @@ interface Pipe {
 }
 
 class BufferPipe implements Pipe {
-    public ?string $buffer = null;
-    public $metadata = null;
+    private ?string $buffer = null;
+    private $metadata = null;
     private bool $closed = false;
 
     public function __construct($buffer = null)
@@ -354,7 +354,7 @@ class BufferPipe implements Pipe {
 }
 
 class ResourcePipe implements Pipe {
-    public $resource;
+    private $resource;
     private bool $closed = false;
     private $bytes;
 
@@ -550,7 +550,7 @@ class CallbackStream extends TransformerStream {
 
 class Demultiplexer extends BufferStream {
     private $process_factory = [];
-    public $subprocesses = [];
+    private $subprocesses = [];
     private $killed_subprocesses = [];
     private $demux_queue = [];
     private $last_subprocess;
@@ -682,8 +682,8 @@ class ZipReader extends BufferStream {
 class StreamChain extends Stream implements Iterator {
     private $first_subprocess;
     private $last_subprocess;
-    public $subprocesses = [];
-    public $subprocesses_names = [];
+    private $subprocesses = [];
+    private $subprocesses_names = [];
     private $reaped_subprocesses = [];
     private $execution_stack = [];
     private $tick_context = [];
@@ -1087,6 +1087,9 @@ $process = new StreamChain(
 );
 
 foreach($process as $k => $chunk) {
-    var_dump([$k => $chunk]);
+    var_dump([
+        $k => $chunk,
+        'zip file_id' => $process['zip']['file_id']
+    ]);
 }
 
