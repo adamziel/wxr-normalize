@@ -156,7 +156,7 @@
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
-abstract class Process {
+abstract class Process implements ArrayAccess {
     private ?int $exit_code = null;
     private bool $is_reaped = false;
     public Pipe $stdin;
@@ -224,6 +224,23 @@ abstract class Process {
     public function skip_file($file_id) {
         // Needs to be implemented by subclasses
         return false;
+    }
+
+
+    public function offsetExists($offset): bool {
+        return isset($this->stdout->get_metadata()[$offset]);
+    }
+
+    public function offsetGet($offset): mixed {
+        return $this->stdout->get_metadata()[$offset] ?? null;
+    }
+
+    public function offsetSet($offset, $value): void {
+        // No op
+    }
+
+    public function offsetUnset($offset): void {
+        // No op
     }
 
 }
@@ -558,6 +575,11 @@ class Demultiplexer extends BufferProcessor {
         parent::__construct();
     }
 
+    public function get_subprocess()
+    {
+        return $this->last_subprocess;        
+    }
+
     protected function write($next_chunk, $metadata) {
         $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
         $this->last_input_key = $chunk_key;
@@ -632,6 +654,11 @@ class ZipReaderProcess extends BufferProcessor {
         $this->reader = new ZipStreamReader('');
     }
 
+    public function get_zip_reader()
+    {
+        return $this->reader;
+    }
+
     public function skip_file($file_id)
     {
         $this->last_skipped_file = $file_id;
@@ -662,46 +689,6 @@ class ZipReaderProcess extends BufferProcessor {
 
         return false;        
     }
-}
-
-class TickContext implements ArrayAccess {
-    private $data;
-    public $process;
-
-    public function offsetExists($offset): bool {
-        $this->get_metadata();
-        return isset($this->data[$offset]);
-    }
-
-    public function offsetGet($offset): mixed {
-        $this->get_metadata();
-        return $this->data[$offset] ?? null;
-    }
-
-    public function offsetSet($offset, $value): void {
-        $this->data[$offset] = $value;
-    }
-
-    public function offsetUnset($offset): void {
-        unset($this->data[$offset]);
-    }
-
-    public function __construct($process)
-    {
-        $this->process = $process;
-    }
-
-    public function get_metadata()
-    {
-        $this->data = $this->process->stdout->get_metadata();
-        return $this->data;
-    }
-
-    public function skip_file($file_id)
-    {
-        return $this->process->skip_file($file_id);        
-    }
-
 }
 
 class ProcessChain extends Process implements Iterator {
@@ -842,14 +829,14 @@ class ProcessChain extends Process implements Iterator {
     {
         array_push($this->execution_stack, $process);
         $name = $this->subprocesses_names[count($this->execution_stack) - 1];
-        $this->tick_context[$name] = new TickContext($process);        
+        $this->tick_context[$name] = $process;
     }
 
     private function tick_subprocess($process)
     {
         $produced_output = $process->tick($this->tick_context);
         $this->handle_errors($process);
-        return $produced_output;        
+        return $produced_output;
     }
 
     private function handle_errors($process)
@@ -909,6 +896,25 @@ class ProcessChain extends Process implements Iterator {
 	public function valid(): bool {
 		return $this->is_alive();
 	}
+
+
+    // ArrayAccess on ProcessChain exposes specific
+    // sub-processes by their names.
+    public function offsetExists($offset): bool {
+        return isset($this->tick_context[$offset]);
+    }
+
+    public function offsetGet($offset): mixed {
+        return $this->tick_context[$offset] ?? null;
+    }
+
+    public function offsetSet($offset, $value): void {
+        // No op
+    }
+
+    public function offsetUnset($offset): void {
+        // No op
+    }
 
 }
 
@@ -974,6 +980,11 @@ class XMLProcess extends BufferProcessor {
 		$this->node_visitor_callback = $node_visitor_callback;
         parent::__construct();
 	}
+
+    public function get_xml_processor()
+    {
+        return $this->xml_processor;
+    }
 
     protected function write($bytes, $metadata)
     {
@@ -1074,10 +1085,11 @@ $process = new ProcessChain([
 
     'zip' => ZipReaderProcess::stream(),
     CallbackProcess::stream(function ($data, $context, $process) {
-        if ($context['zip']['file_id'] === 'export.wxr') {
+        if ($context['zip']['file_id'] !== 'export.wxr') {
             $context['zip']->skip_file('export.wxr');
             return null;
         }
+        print_r($context['zip']->get_subprocess()->get_zip_reader()->get_header());
         return $data;
     }),
     'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
