@@ -550,10 +550,10 @@ class CallbackStream extends TransformerStream {
 
 class Demultiplexer extends BufferStream {
     private $stream_create = [];
-    private $subprocesses = [];
-    private $killed_subprocesses = [];
+    private $streams = [];
+    private $killed_streams = [];
     private $demux_queue = [];
-    private $last_subprocess;
+    private $last_stream;
     private $last_input_key;
     private $key;
     
@@ -563,52 +563,52 @@ class Demultiplexer extends BufferStream {
         parent::__construct();
     }
 
-    public function get_subprocess()
+    public function get_substream()
     {
-        return $this->last_subprocess;        
+        return $this->last_stream;
     }
 
     protected function write($next_chunk, $metadata, $tick_context) {
         $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
         $this->last_input_key = $chunk_key;
-        if (!isset($this->subprocesses[$chunk_key])) {
+        if (!isset($this->streams[$chunk_key])) {
             $create = $this->stream_create;
-            $this->subprocesses[$chunk_key] = $create();
+            $this->streams[$chunk_key] = $create();
         }
 
-        $subprocess = $this->subprocesses[$chunk_key];
-        $subprocess->input->write($next_chunk, $metadata);
-        $this->last_subprocess = $subprocess;
+        $stream = $this->streams[$chunk_key];
+        $stream->input->write($next_chunk, $metadata);
+        $this->last_stream = $stream;
     }
 
     protected function read(): bool
     {
-        $subprocess = $this->last_subprocess;
-        if(!$subprocess) {
+        $stream = $this->last_stream;
+        if(!$stream) {
             return false;
         }
 
-        if(!$subprocess->tick()) {
+        if(!$stream->tick()) {
             return false;
         }
     
-        if ($subprocess->output->read()) {
-            $output = $subprocess->output->consume_bytes();
+        if ($stream->output->read()) {
+            $output = $stream->output->consume_bytes();
             $chunk_metadata = array_merge(
                 [$this->key => $this->last_input_key],
-                $subprocess->output->get_metadata() ?? [],
+                $stream->output->get_metadata() ?? [],
             );
             $this->output->write($output, $chunk_metadata);
             return true;
         }
 
-        if (!$subprocess->is_alive()) {
-            if ($subprocess->has_crashed()) {
+        if (!$stream->is_alive()) {
+            if ($stream->has_crashed()) {
                 $this->errors->write(
                     "Subprocess $this->last_input_key has crashed",
                     [
                         'type' => 'crash',
-                        'process' => $subprocess,
+                        'stream' => $stream,
                     ]
                 );
             }
@@ -619,10 +619,10 @@ class Demultiplexer extends BufferStream {
 
     public function skip_file($file_id)
     {
-        if(!$this->last_subprocess) {
+        if(!$this->last_stream) {
             return false;
         }
-        return $this->last_subprocess->skip_file($file_id);
+        return $this->last_stream->skip_file($file_id);
     }
 }
 
@@ -680,8 +680,8 @@ class ZipReaderStream extends BufferStream {
 }
 
 class StreamChain extends Stream implements Iterator {
-    private $first_subprocess;
-    private $last_subprocess;
+    private $first_stream;
+    private $last_stream;
     private $streams = [];
     private $streams_names = [];
     private $finished_streams = [];
@@ -691,7 +691,7 @@ class StreamChain extends Stream implements Iterator {
     public function __construct($streams, $input=null, $output=null, $errors=null) {
         parent::__construct($input, $output, $errors);
 
-        $last_process = null;
+        $last_stream = null;
         $this->streams_names = array_keys($streams);
         foreach($this->streams_names as $k => $name) {
             $this->streams_names[$k] = $name . '';
@@ -700,21 +700,21 @@ class StreamChain extends Stream implements Iterator {
         $streams = array_values($streams);
         for($i = 0; $i < count($streams); $i++) {
             $stream = $streams[$i];
-            if(null !== $last_process) {
-                $stream->input = $last_process->output;
+            if(null !== $last_stream) {
+                $stream->input = $last_stream->output;
             }
             $this->streams[$this->streams_names[$i]] = $stream;
-            $last_process = $stream;
+            $last_stream = $stream;
         }
 
-        $this->first_subprocess = $this->streams[$this->streams_names[0]];
-        $this->last_subprocess = $this->streams[$this->streams_names[count($streams) - 1]];
+        $this->first_stream = $this->streams[$this->streams_names[0]];
+        $this->last_stream = $this->streams[$this->streams_names[count($streams) - 1]];
     }
 
     /**
      * ## Process chain tick
      * 
-     * Pushes data through a chain of subprocesses. Every downstream data chunk
+     * Pushes data through a chain of streams. Every downstream data chunk
      * is fully processed before asking for more chunks upstream.
      * 
      * For example, suppose we:
@@ -736,7 +736,7 @@ class StreamChain extends Stream implements Iterator {
      * metadata and exposes methods like skip_file().
      */
     protected function do_tick($tick_context): bool {
-        if($this->last_subprocess->output->is_eof()) {
+        if($this->last_stream->output->is_eof()) {
             $this->finish();
             return false;
         }
@@ -745,18 +745,18 @@ class StreamChain extends Stream implements Iterator {
             if(true !== $this->input->read()) {
                 break;
             }
-            $this->first_subprocess->input->write(
+            $this->first_stream->input->write(
                 $this->input->consume_bytes(),
                 $this->input->get_metadata()
             );
         }
 
         if($this->input->is_eof()) {
-            $this->first_subprocess->input->close();
+            $this->first_stream->input->close();
         }
 
         if(empty($this->execution_stack)) {
-            array_push($this->execution_stack, $this->first_subprocess);
+            array_push($this->execution_stack, $this->first_stream);
         }
 
         while (count($this->execution_stack)) {
@@ -771,25 +771,25 @@ class StreamChain extends Stream implements Iterator {
                 continue;
             }
 
-            // We've got output from the process, yay! Let's
+            // We've got output from the stream, yay! Let's
             // propagate it downstream.
             $this->push_stream($stream);
 
             for ($i = count($this->execution_stack); $i < count($this->streams_names); $i++) {
-                $next_process = $this->streams[$this->streams_names[$i]];
-                if (true !== $this->tick_stream($next_process)) {
+                $next_stream = $this->streams[$this->streams_names[$i]];
+                if (true !== $this->tick_stream($next_stream)) {
                     break;
                 }
-                $this->push_stream($next_process);
+                $this->push_stream($next_stream);
             }
 
             // When the last process in the chain produces output,
             // we write it to the output pipe and bale.
-            if(true !== $this->last_subprocess->output->read()) {
+            if(true !== $this->last_stream->output->read()) {
                 break;
             }
             $this->output->write(
-                $this->last_subprocess->output->consume_bytes(),
+                $this->last_stream->output->consume_bytes(),
                 $this->tick_context
             );
             ++$this->chunk_nb;
@@ -798,7 +798,7 @@ class StreamChain extends Stream implements Iterator {
 
         // We produced no output and the upstream pipe is EOF.
         // We're done.
-        if(!$this->first_subprocess->is_alive()) {
+        if(!$this->first_stream->is_alive()) {
             $this->finish();
         }
 
@@ -817,7 +817,7 @@ class StreamChain extends Stream implements Iterator {
         array_push($this->execution_stack, $stream);
         $name = $this->streams_names[count($this->execution_stack) - 1];
         if($stream instanceof Demultiplexer) {
-            $stream = $stream->get_subprocess();
+            $stream = $stream->get_substream();
         }
         $this->tick_context[$name] = $stream;
     }
@@ -836,14 +836,14 @@ class StreamChain extends Stream implements Iterator {
             if(!isset($this->finished_streams[$name])) {
                 $this->errors->write("Process $name has crashed", [
                     'type' => 'crash',
-                    'process' => $stream,
+                    'stream' => $stream,
                 ]);
                 $this->finished_streams[$name] = true;
             }
         } else if ($stream->errors->read()) {
             $this->errors->write($stream->errors->consume_bytes(), [
                 'type' => 'error',
-                'process' => $stream,
+                'stream' => $stream,
                 ...($stream->errors->get_metadata() ?? []),
             ]);
         }
