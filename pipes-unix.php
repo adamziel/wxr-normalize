@@ -533,8 +533,8 @@ class MultiplexingPipe implements Pipe {
 class CallbackStream extends TransformerStream {
     private $callback;
     
-    static public function factory($callback) {
-        return fn () => new static($callback);
+    static public function create($callback) {
+        return new static($callback);
     }
 
     private function __construct($callback) {
@@ -549,7 +549,7 @@ class CallbackStream extends TransformerStream {
 }
 
 class Demultiplexer extends BufferStream {
-    private $stream_factory = [];
+    private $stream_create = [];
     private $subprocesses = [];
     private $killed_subprocesses = [];
     private $demux_queue = [];
@@ -557,8 +557,8 @@ class Demultiplexer extends BufferStream {
     private $last_input_key;
     private $key;
     
-    public function __construct($stream_factory, $key = 'sequence') {
-        $this->stream_factory = $stream_factory;
+    public function __construct($stream_create, $key = 'sequence') {
+        $this->stream_create = $stream_create;
         $this->key = $key;
         parent::__construct();
     }
@@ -572,8 +572,8 @@ class Demultiplexer extends BufferStream {
         $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
         $this->last_input_key = $chunk_key;
         if (!isset($this->subprocesses[$chunk_key])) {
-            $factory = $this->stream_factory;
-            $this->subprocesses[$chunk_key] = $factory();
+            $create = $this->stream_create;
+            $this->subprocesses[$chunk_key] = $create();
         }
 
         $subprocess = $this->subprocesses[$chunk_key];
@@ -628,13 +628,13 @@ class Demultiplexer extends BufferStream {
 
 require __DIR__ . '/zip-stream-reader.php';
 
-class ZipReader extends BufferStream {
+class ZipReaderStream extends BufferStream {
 
     private $reader;
     private $last_skipped_file = null;
 
-    static public function factory() {
-        return fn () => new Demultiplexer(fn() => new ZipReader());
+    static public function create() {
+        return new Demultiplexer(fn() => new ZipReaderStream());
     }
 
     protected function __construct() {
@@ -688,28 +688,27 @@ class StreamChain extends Stream implements Iterator {
     private $execution_stack = [];
     private $tick_context = [];
 
-    public function __construct($streams_factories, $input=null, $output=null, $errors=null) {
+    public function __construct($streams, $input=null, $output=null, $errors=null) {
         parent::__construct($input, $output, $errors);
 
         $last_process = null;
-        $this->streams_names = array_keys($streams_factories);
+        $this->streams_names = array_keys($streams);
         foreach($this->streams_names as $k => $name) {
             $this->streams_names[$k] = $name . '';
         }
 
-        $streams = array_values($streams_factories);
-        for($i = 0; $i < count($streams_factories); $i++) {
-            $factory = $streams[$i];
-            $subprocess = $factory();
+        $streams = array_values($streams);
+        for($i = 0; $i < count($streams); $i++) {
+            $stream = $streams[$i];
             if(null !== $last_process) {
-                $subprocess->input = $last_process->output;
+                $stream->input = $last_process->output;
             }
-            $this->streams[$this->streams_names[$i]] = $subprocess;
-            $last_process = $subprocess;
+            $this->streams[$this->streams_names[$i]] = $stream;
+            $last_process = $stream;
         }
 
         $this->first_subprocess = $this->streams[$this->streams_names[0]];
-        $this->last_subprocess = $this->streams[$this->streams_names[count($streams_factories) - 1]];
+        $this->last_subprocess = $this->streams[$this->streams_names[count($streams) - 1]];
     }
 
     /**
@@ -913,8 +912,8 @@ class HttpStream extends Stream {
 	private $child_contexts = [];
 	private $skipped_requests = [];
 
-    static public function factory($requests) {
-        return fn () => new HttpStream($requests);
+    static public function create($requests) {
+        return new HttpStream($requests);
     }
 
 	private function __construct( $requests ) {
@@ -952,13 +951,13 @@ class HttpStream extends Stream {
 }
 
 
-class XMLStream extends BufferStream {
+class XMLTransformStream extends BufferStream {
 	private $xml_processor;
 	private $node_visitor_callback;
 
-    static public function factory($node_visitor_callback) {
-        return fn () => new Demultiplexer(fn () =>
-            new XMLStream($node_visitor_callback)
+    static public function create($node_visitor_callback) {
+        return new Demultiplexer(fn () =>
+            new XMLTransformStream($node_visitor_callback)
         );
     }
 
@@ -1054,13 +1053,13 @@ require __DIR__ . '/bootstrap.php';
 
 $stream = new StreamChain(
     [
-        HttpStream::factory([
+        HttpStream::create([
             new Request('http://127.0.0.1:9864/export.wxr.zip'),
             // Bad request, will fail:
             new Request('http://127.0.0.1:9865'),
         ]),
-        'zip' => ZipReader::factory(),
-        CallbackStream::factory(function ($data, $context) {
+        'zip' => ZipReaderStream::create(),
+        CallbackStream::create(function ($data, $context) {
             if ($context['zip']['file_id'] !== 'export.wxr') {
                 $context['zip']->skip_file('export.wxr');
                 return null;
@@ -1068,7 +1067,7 @@ $stream = new StreamChain(
             print_r($context['zip']->get_zip_reader()->get_header());
             return $data;
         }),
-        'xml' => XMLStream::factory(function (WP_XML_Processor $processor) {
+        'xml' => XMLTransformStream::create(function (WP_XML_Processor $processor) {
             if (is_wxr_content_node($processor)) {
                 $text = $processor->get_modifiable_text();
                 $updated_text = 'Hey there, what\'s up?';
@@ -1077,7 +1076,7 @@ $stream = new StreamChain(
                 }
             }
         }),
-        CallbackStream::factory(function ($data, $context) {
+        CallbackStream::create(function ($data, $context) {
             return strtoupper($data);
         })
     ],
