@@ -28,6 +28,10 @@ class ZipStreamReader implements IStreamProcessor {
 	const STATE_COMPLETE = 'complete';
 	const STATE_ERROR = 'error';
 
+    static public function stream() {
+        return new Demultiplexer(fn() => new ZipReaderStream());
+    }
+	
 	public function __construct($bytes='') {
 		$this->zip = $bytes;
 	}

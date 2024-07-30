@@ -18,11 +18,13 @@ interface IByteStream {
     const STATE_STREAMING = '#streaming';
     const STATE_FINISHED = '#finished';
 
-    public function next_bytes(): bool;
     public function input_eof();
-    public function append_bytes(string $bytes, $context = null);
     public function is_output_eof(): bool;
+
+    public function next_bytes(): bool;
+    public function append_bytes(string $bytes, $context = null);
     public function get_bytes(): ?string;
+
     public function get_last_error(): ?string;
 }
 
