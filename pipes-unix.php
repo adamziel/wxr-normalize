@@ -159,9 +159,9 @@ use WordPress\AsyncHttp\Request;
 abstract class Process implements ArrayAccess {
     private ?int $exit_code = null;
     private bool $is_reaped = false;
-    public Pipe $stdin;
-    public Pipe $stdout;
-    public Pipe $stderr;
+    protected Pipe $stdin;
+    protected Pipe $stdout;
+    protected Pipe $stderr;
 
     public function __construct($stdin=null, $stdout=null, $stderr=null)
     {
@@ -262,31 +262,42 @@ abstract class BufferProcessor extends Process
 
         $this->write(
             $this->stdin->consume_bytes(),
-            $this->stdin->get_metadata()
+            $this->stdin->get_metadata(),
+            $tick_context
         );
 
         return $this->read();
     }
 
-    abstract protected function write($input_chunk, $metadata);
+    abstract protected function write($input_chunk, $metadata, $tick_context);
     abstract protected function read(): bool;
 }
 
-abstract class TransformProcess extends Process {
-    protected function do_tick($tick_context): bool {
-        if(!$this->stdin->read()) {
-            if($this->stdin->is_eof()) {
-                $this->kill(0);
-            }
+abstract class TransformProcess extends BufferProcessor {
+
+    protected $buffer;
+    protected $metadata;
+    protected $tick_context;
+
+    protected function write($input_chunk, $metadata, $tick_context)
+    {
+        $this->buffer .= $input_chunk;
+        $this->metadata = $metadata;
+        $this->tick_context = $tick_context;
+    }
+
+    protected function read(): bool
+    {
+        if(null === $this->buffer) {
             return false;
         }
-
-        $transformed = $this->transform($this->stdin->consume_bytes(), $tick_context);
+        $transformed = $this->transform($this->buffer, $this->tick_context);
+        $this->buffer = null;
         if (null === $transformed || false === $transformed) {
             return false;
         }
 
-        $this->stdout->write($transformed, $this->stdin->get_metadata());
+        $this->stdout->write($transformed, $this->metadata);
         return true;
     }
 
@@ -546,7 +557,7 @@ class CallbackProcess extends TransformProcess {
     private $callback;
     
     static public function stream($callback) {
-        return fn () => new CallbackProcess($callback);
+        return fn () => new static($callback);
     }
 
     private function __construct($callback) {
@@ -580,7 +591,7 @@ class Demultiplexer extends BufferProcessor {
         return $this->last_subprocess;        
     }
 
-    protected function write($next_chunk, $metadata) {
+    protected function write($next_chunk, $metadata, $tick_context) {
         $chunk_key = is_array($metadata) && !empty( $metadata[$this->key] ) ? $metadata[$this->key] : 'default';
         $this->last_input_key = $chunk_key;
         if (!isset($this->subprocesses[$chunk_key])) {
@@ -664,7 +675,7 @@ class ZipReaderProcess extends BufferProcessor {
         $this->last_skipped_file = $file_id;
     }
 
-    protected function write($bytes, $metadata) {
+    protected function write($bytes, $metadata, $tick_context) {
         $this->reader->append_bytes($bytes);
     }
 
@@ -700,8 +711,8 @@ class ProcessChain extends Process implements Iterator {
     private $execution_stack = [];
     private $tick_context = [];
 
-    public function __construct($process_factories) {
-        parent::__construct();
+    public function __construct($process_factories, $stdin=null, $stdout=null, $stderr=null) {
+        parent::__construct($stdin, $stdout, $stderr);
 
         $last_process = null;
         $this->subprocesses_names = array_keys($process_factories);
@@ -989,7 +1000,7 @@ class XMLProcess extends BufferProcessor {
         return $this->xml_processor;
     }
 
-    protected function write($bytes, $metadata)
+    protected function write($bytes, $metadata, $tick_context)
     {
         $this->xml_processor->stream_append_xml($bytes);
     }
@@ -1079,27 +1090,30 @@ $rewrite_links_in_wxr_node = function (WP_XML_Processor $processor) {
 require __DIR__ . '/bootstrap.php';
 
 
-$process = new ProcessChain([
-    HttpClientProcess::stream([
-        new Request('http://127.0.0.1:9864/export.wxr.zip'),
-        // Bad request, will fail:
-        new Request('http://127.0.0.1:9865'),
-    ]),
+$process = new ProcessChain(
+    [
+        HttpClientProcess::stream([
+            new Request('http://127.0.0.1:9864/export.wxr.zip'),
+            // Bad request, will fail:
+            new Request('http://127.0.0.1:9865'),
+        ]),
 
-    'zip' => ZipReaderProcess::stream(),
-    CallbackProcess::stream(function ($data, $context, $process) {
-        if ($context['zip']['file_id'] !== 'export.wxr') {
-            $context['zip']->skip_file('export.wxr');
-            return null;
-        }
-        print_r($context['zip']->get_zip_reader()->get_header());
-        return $data;
-    }),
-    'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
-    Uppercaser::stream(),
-]);
-// $process->stdout = new FilePipe('php://stdout', 'w');
-$process->stderr = new FilePipe('php://stderr', 'w');
+        'zip' => ZipReaderProcess::stream(),
+        CallbackProcess::stream(function ($data, $context, $process) {
+            if ($context['zip']['file_id'] !== 'export.wxr') {
+                $context['zip']->skip_file('export.wxr');
+                return null;
+            }
+            print_r($context['zip']->get_zip_reader()->get_header());
+            return $data;
+        }),
+        'xml' => XMLProcess::stream($rewrite_links_in_wxr_node),
+        Uppercaser::stream(),
+    ],
+    null,
+    null,
+    new FilePipe('php://stderr', 'w')
+);
 foreach($process as $k => $chunk) {
     var_dump([$k => $chunk]);
 }
