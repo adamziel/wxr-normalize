@@ -570,7 +570,7 @@ class HTTP_Client
 }
 
 // Imagine this method is implemented in the ZipStreamReader class
-class ZIP_Processor
+class ZIP_Reader
 {
     static public function stream()
     {
@@ -599,7 +599,7 @@ $chain = new StreamChain(
             // Bad request, will fail:
             new Request('http://127.0.0.1:9865')
         ]),
-        'zip' => ZIP_Processor::stream(),
+        'zip' => ZIP_Reader::stream(),
         Byte_Stream::map(function($bytes, $context) {
             if($context['zip']->get_file_id() === 'export.wxr') {
                 $context['zip']->skip_file();
