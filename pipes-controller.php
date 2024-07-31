@@ -9,22 +9,7 @@ use WordPress\AsyncHttp\Request;
 abstract class Byte_Stream {
 
     protected $state;
-
-    static public function map($callback) {
-        return new Callback_Byte_Stream(function($state) use ($callback) {
-            $bytes = $state->consume_input_bytes();
-            if(!$bytes) {
-                return false;
-            }
-            $output = $callback($bytes, $state->input_context);
-            if(null === $output) {
-                return false;
-            }
-            $state->output_bytes = $output;
-            return true;
-        });
-    }
-
+    
     public function __construct() {
         $this->state = new ByteStreamState();
     }
@@ -92,6 +77,22 @@ abstract class Byte_Stream {
         return $this->state->last_error;
     }
 
+    // Utility methods
+    static public function map($mapper) {
+        return new Callback_Byte_Stream(function($state) use ($mapper) {
+            $bytes = $state->consume_input_bytes();
+            if(!$bytes) {
+                return false;
+            }
+            $output = $mapper($bytes, $state->input_context);
+            if(null === $output) {
+                return false;
+            }
+            $state->output_bytes = $output;
+            return true;
+        });
+    }
+
 }
 
 class Callback_Byte_Stream extends Byte_Stream {
@@ -109,10 +110,21 @@ class Callback_Byte_Stream extends Byte_Stream {
 
 }
 
+
 class ProcessorByteStream extends Byte_Stream
 {
     public $processor;
     protected $generate_next_chunk_callback;
+
+    static public function demuxed($processor_factory, $callback)
+    {
+        return new Demultiplexer(function () use ($processor_factory, $callback) {
+            $processor = $processor_factory();
+            return new ProcessorByteStream($processor, function($state) use($processor, $callback) {
+                return $callback($processor, $state);
+            });
+        });
+    }
 
     public function __construct($processor, $generate_next_chunk_callback)
     {
@@ -424,16 +436,11 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     private function stream_next(Byte_Stream $stream)
     {
         $produced_output = $stream->next_bytes();
-        $this->handle_errors($stream);
-        return $produced_output;
-    }
-
-    private function handle_errors(Byte_Stream $stream)
-    {
         if($stream->state->last_error) {
             $name = array_search($stream, $this->streams);
             $this->state->last_error = "Process $name has crashed (" . $stream->state->last_error . ")";
         }
+        return $produced_output;
     }
 
     // Iterator methods. These don't make much sense on a regular
@@ -506,9 +513,9 @@ class XML_Processor
 {
     static public function stream($node_visitor_callback)
     {
-        return new Demultiplexer(function () use ($node_visitor_callback) {
-            $xml_processor = new WP_XML_Processor('', [], WP_XML_Processor::IN_PROLOG_CONTEXT);
-            return new ProcessorByteStream($xml_processor, function (ByteStreamState $state) use ($xml_processor, $node_visitor_callback) {
+        return ProcessorByteStream::demuxed(
+            function () { return new WP_XML_Processor('', [], WP_XML_Processor::IN_PROLOG_CONTEXT); },
+            function (WP_XML_Processor $xml_processor, ByteStreamState $state) use ($node_visitor_callback) {
                 $tokens_found = 0;
                 while ($xml_processor->next_token()) {
                     ++$tokens_found;
@@ -535,8 +542,8 @@ class XML_Processor
 
                 $state->output_bytes = $buffer;
                 return true;
-            });
-        });
+            }
+        );
     }
 }
 
@@ -573,9 +580,9 @@ class ZIP_Processor
 {
     static public function stream()
     {
-        return new Demultiplexer(function () {
-            $zip_reader = new ZipStreamReader('');
-            return new ProcessorByteStream($zip_reader, function (ByteStreamState $state) use ($zip_reader) {
+        return ProcessorByteStream::demuxed(
+            function () { return new ZipStreamReader(); },
+            function (ZipStreamReader $zip_reader, ByteStreamState $state) {
                 while ($zip_reader->next()) {
                     switch ($zip_reader->get_state()) {
                         case ZipStreamReader::STATE_FILE_ENTRY:
@@ -585,8 +592,8 @@ class ZIP_Processor
                     }
                 }
                 return false;
-            });
-        });
+            }
+        );
     }
 }
 
