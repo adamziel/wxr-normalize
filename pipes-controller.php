@@ -111,34 +111,28 @@ class Callback_Byte_Stream extends Byte_Stream {
 }
 
 
-class ProcessorByteStream extends Byte_Stream
+class ProcessorByteStream extends Callback_Byte_Stream
 {
     public $processor;
-    protected $generate_next_chunk_callback;
+
+    public function __construct($processor, $generate_next_chunk_callback)
+    {
+        $this->processor = $processor;
+        parent::__construct($generate_next_chunk_callback);
+    }
 
     static public function demuxed($processor_factory, $callback)
     {
         return new Demultiplexer(function () use ($processor_factory, $callback) {
             $processor = $processor_factory();
             return new ProcessorByteStream($processor, function($state) use($processor, $callback) {
+                $new_bytes = $state->consume_input_bytes();
+                if (null !== $new_bytes) {
+                    $processor->append_bytes($new_bytes);
+                }
                 return $callback($processor, $state);
             });
         });
-    }
-
-    public function __construct($processor, $generate_next_chunk_callback)
-    {
-        $this->processor = $processor;
-        $this->generate_next_chunk_callback = $generate_next_chunk_callback;
-        parent::__construct();
-    }
-
-    protected function generate_next_chunk(): bool {
-        $new_bytes = $this->state->consume_input_bytes();
-        if (null !== $new_bytes) {
-            $this->processor->append_bytes($new_bytes);
-        }
-        return ($this->generate_next_chunk_callback)($this->state);
     }
 }
 
