@@ -6,13 +6,12 @@ require __DIR__ . '/zip-stream-reader.php';
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
 
-class Byte_Stream {
+abstract class Byte_Stream {
 
-    protected $next_bytes_callback;
     protected $state;
 
     static public function map($callback) {
-        return new Byte_Stream(function($state) use ($callback) {
+        return new Callback_Byte_Stream(function($state) use ($callback) {
             $bytes = $state->consume_input_bytes();
             if(!$bytes) {
                 return false;
@@ -26,8 +25,7 @@ class Byte_Stream {
         });
     }
 
-    public function __construct($next_bytes_callback) {
-        $this->next_bytes_callback = $next_bytes_callback;
+    public function __construct() {
         $this->state = new ByteStreamState();
     }
 
@@ -71,8 +69,7 @@ class Byte_Stream {
         }
 
         // Process any remaining buffered input:
-        $calback = $this->next_bytes_callback;
-        if($calback($this->state)) {
+        if($this->generate_next_chunk()) {
             return ! $this->is_skipped_file();
         }
 
@@ -83,8 +80,12 @@ class Byte_Stream {
             return false;
         }
 
-        return $calback($this->state) && ! $this->is_skipped_file();
+        $produced_bytes = $this->generate_next_chunk();
+
+        return $produced_bytes && ! $this->is_skipped_file();
     }
+
+    abstract protected function generate_next_chunk(): bool;
 
     public function get_last_error(): string|null
     {
@@ -93,20 +94,39 @@ class Byte_Stream {
 
 }
 
+class Callback_Byte_Stream extends Byte_Stream {
+
+    protected $generate_next_chunk_callback;
+
+    public function __construct($generate_next_chunk_callback) {
+        $this->generate_next_chunk_callback = $generate_next_chunk_callback;
+        parent::__construct();
+    }
+
+    protected function generate_next_chunk(): bool {
+        return ($this->generate_next_chunk_callback)($this->state);
+    }
+
+}
+
 class ProcessorByteStream extends Byte_Stream
 {
     public $processor;
+    protected $generate_next_chunk_callback;
 
-    public function __construct($processor, $callback)
+    public function __construct($processor, $generate_next_chunk_callback)
     {
         $this->processor = $processor;
-        parent::__construct(function($state) use($processor, $callback) {
-            $new_bytes = $state->consume_input_bytes();
-            if (null !== $new_bytes) {
-                $processor->append_bytes($new_bytes);
-            }
-            return $callback($state);
-        });
+        $this->generate_next_chunk_callback = $generate_next_chunk_callback;
+        parent::__construct();
+    }
+
+    protected function generate_next_chunk(): bool {
+        $new_bytes = $this->state->consume_input_bytes();
+        if (null !== $new_bytes) {
+            $this->processor->append_bytes($new_bytes);
+        }
+        return ($this->generate_next_chunk_callback)($this->state);
     }
 }
 
@@ -190,7 +210,7 @@ class Demultiplexer extends Byte_Stream {
     
     public function __construct($stream_factory) {
         $this->stream_factory = $stream_factory;
-        parent::__construct([$this, 'tick']);
+        parent::__construct();
     }
 
     public function get_substream()
@@ -198,7 +218,7 @@ class Demultiplexer extends Byte_Stream {
         return $this->last_stream;
     }
 
-    protected function tick(): bool
+    protected function generate_next_chunk(): bool
     {
         $stream = $this->last_stream;
         if (!$stream) {
@@ -256,7 +276,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     private $streams = [];
     private $streams_names = [];
     private $execution_stack = [];
-    private $tick_context = [];
+    private $chunk_context = [];
 
     public function __construct($streams) {
         $named_streams = [];
@@ -269,11 +289,11 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
         $this->streams_names = array_keys($this->streams);
         $this->first_stream = $this->streams[$this->streams_names[0]];
         $this->last_stream = $this->streams[$this->streams_names[count($streams) - 1]];
-        parent::__construct([$this, 'tick']);
+        parent::__construct();
     }
 
     /**
-     * ## Process chain tick
+     * ## Next chunk generation
      * 
      * Pushes data through a chain of streams. Every downstream data chunk
      * is fully processed before asking for more chunks upstream.
@@ -296,7 +316,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
      * This way we can maintain a predictable $context variable that carries upstream
      * metadata and exposes methods like skip_file().
      */
-    protected function tick(): bool {
+    protected function generate_next_chunk(): bool {
         if($this->last_stream->is_eof()) {
             $this->state->finish();
             return false;
@@ -345,7 +365,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 
                 $next_stream->append_bytes(
                     $prev_stream->state->output_bytes,
-                    $this->tick_context
+                    $this->chunk_context
                 );
                 if (true !== $this->stream_next($next_stream)) {
                     return false;
@@ -387,7 +407,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     private function pop_stream(): Byte_Stream
     {
         $name = $this->streams_names[count($this->execution_stack) - 1];
-        unset($this->tick_context[$name]);
+        unset($this->chunk_context[$name]);
         return array_pop($this->execution_stack);
     }
 
@@ -398,7 +418,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
         if($stream instanceof Demultiplexer) {
             $stream = $stream->get_substream();
         }
-        $this->tick_context[$name] = $stream;
+        $this->chunk_context[$name] = $stream;
     }
 
     private function stream_next(Byte_Stream $stream)
@@ -463,11 +483,11 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     // ArrayAccess on ProcessChain exposes specific
     // sub-processes by their names.
     public function offsetExists($offset): bool {
-        return isset($this->tick_context[$offset]);
+        return isset($this->chunk_context[$offset]);
     }
 
     public function offsetGet($offset): mixed {
-        return $this->tick_context[$offset] ?? null;
+        return $this->chunk_context[$offset] ?? null;
     }
 
     public function offsetSet($offset, $value): void {
@@ -527,7 +547,7 @@ class HTTP_Client
     {
         $client = new Client();
         $client->enqueue($requests);
-        return new Byte_Stream(function (ByteStreamState $state) use ($client) {
+        return new Callback_Byte_Stream(function (ByteStreamState $state) use ($client) {
             $request = null;
             while ($client->await_next_event()) {
                 $request = $client->get_request();
