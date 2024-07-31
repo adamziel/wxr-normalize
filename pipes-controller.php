@@ -32,6 +32,19 @@ abstract class Byte_Stream {
         return $this->state->file_id === $this->state->last_skipped_file;
     }
 
+    public function get_chunk_type()
+    {
+        if($this->get_last_error()) {
+            return '#error';
+        }
+
+        if ($this->is_eof()) {
+            return '#eof';
+        }
+
+        return '#bytes';        
+    }
+
     public function append_eof() {
         $this->state->input_eof = true;
     }
@@ -285,6 +298,8 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     private $chunk_context = [];
 
     public function __construct($streams) {
+        $this->chunk_context['chain'] = $this;
+
         $named_streams = [];
         foreach($streams as $name => $stream) {
             $string_name = is_numeric($name) ? 'stream_' . $name : $name;
@@ -388,8 +403,6 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             }
             $this->state->file_id = $this->last_stream->state->file_id;
             $this->state->output_bytes = $this->last_stream->state->output_bytes;
-
-            ++$this->chunk_nb;
             return true;
         }
 
@@ -442,31 +455,26 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
     // the top of the stream like ProcessChain can.
 
 	public function current(): mixed {
-        if($this->should_iterate_errors && $this->get_last_error()) {
-            return $this->get_last_error();
-        }
-        return $this->get_bytes();
+        return $this;
 	}
 
-    private $chunk_nb = -1;
 	public function key(): mixed {
-		return $this->chunk_nb;
+		return $this->get_chunk_type();
 	}
 
 	public function rewind(): void {
 		$this->next();
 	}
 
-    private $should_iterate_errors = false;
-    public function iterate_errors($should_iterate_errors)
+    private $should_stop_on_errors = false;
+    public function stop_on_errors($should_stop_on_errors)
     {
-        $this->should_iterate_errors = $should_iterate_errors;
+        $this->should_stop_on_errors = $should_stop_on_errors;
     }
 
 	public function next(): void {
-        ++$this->chunk_nb;
 		while(!$this->next_bytes()) {
-            if($this->should_iterate_errors && $this->state->last_error) {
+            if($this->should_stop_on_errors && $this->state->last_error) {
                 break;
             }
             if($this->is_eof()) {
@@ -477,7 +485,7 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
 	}
 
 	public function valid(): bool {
-		return !$this->is_eof() || ($this->should_iterate_errors && $this->state->last_error);
+		return !$this->is_eof() || ($this->should_stop_on_errors && $this->state->last_error);
 	}
 
 
@@ -616,12 +624,18 @@ $chain = new StreamChain(
 // var_dump([$chain->next_chunk(), strlen($chain->get_bytes()), $chain->get_last_error()]);
 
 // Or like this:
-// $chain->iterate_errors(true);
-foreach($chain as $k => $chunk_or_error) {
-    var_dump([
-        $k => $chunk_or_error,
-        'is_error' => !!$chain->get_last_error(),
-        'zip file_id' => isset($chain['zip']) ? $chain['zip']->get_file_id() : null
-    ]);
+$chain->stop_on_errors(true);
+foreach($chain as $chunk) {
+    switch($chunk->get_chunk_type()) {
+        case '#error':
+            echo "Error: " . $chunk->get_last_error() . "\n";
+            break;
+        case '#bytes':
+            var_dump([
+                $chunk->get_bytes(),
+                'zip file_id' => isset($chain['zip']) ? $chain['zip']->get_file_id() : null
+            ]);
+            break;
+    }
 }
 
