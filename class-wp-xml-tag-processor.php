@@ -443,7 +443,7 @@ class WP_XML_Tag_Processor {
 	 *
 	 * @var int|null
 	 */
-	private $token_starts_at;
+	protected $token_starts_at;
 
 	/**
 	 * Byte length of current token.

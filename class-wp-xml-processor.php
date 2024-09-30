@@ -88,6 +88,26 @@ class WP_XML_Processor extends WP_XML_Tag_Processor implements IStreamProcessor 
 		}
 	}
 
+	public function pause() {
+		return new Paused_Stream(self::class, array(
+			'xml' => $this->xml,
+			// @TODO: Include all the information below in the bookmark:
+			'bytes_already_parsed' => $this->token_starts_at,
+			'breadcrumbs' => $this->get_breadcrumbs(),
+			'parser_context' => $this->get_parser_context(),
+			'stack_of_open_elements' => $this->stack_of_open_elements,
+		));
+	}
+
+	public function resume($paused_state) {
+		$state = $paused_state['data'];
+		$this->xml = $state['xml'];
+		$this->stack_of_open_elements = $state['stack_of_open_elements'];
+		$this->parser_context = $state['parser_context'];
+		$this->bytes_already_parsed = $state['bytes_already_parsed'];
+		$this->base_class_next_token();
+	}
+
 	/**
 	 * Wipes out the processed XML and appends the next chunk of XML to
 	 * any remaining unprocessed XML.

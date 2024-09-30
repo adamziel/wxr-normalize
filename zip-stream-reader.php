@@ -2,22 +2,37 @@
 
 define('RUN_ZIP_SMOKE_TEST', false);
 
-class ZipStreamReader implements IStreamProcessor {
+class ZipStreamReaderCursor {
+	public $zip = '';
+	public $bytes_parsed_so_far = 0;
+	public $state = ZipStreamReader::STATE_SCAN;
+	public $header = null;
+	public $file_body_chunk = null;
+	/**
+	 * Experimental: Store the last used compressed chunk so that we can recreate
+	 * the inflate context. This is necessary, because deflate-raw has a variable
+	 * block size and the binary data we've already seen contain information required
+	 * to continue the decompression process.
+	 * 
+	 * @TODO: Rigorously confirm that this reasoning is correct and then rigorously
+	 *        keep track of as many $last_compressed_bytes as necessary.
+	 */
+	public $last_compressed_bytes = '';
+	public $file_compressed_bytes_read_so_far = null;
+	public $paused_incomplete_input = false;
+	public $error_message;
+}
+
+// class ZipStreamReader implements IStreamProcessor {
+class ZipStreamReader {
 
 	const SIGNATURE_FILE                  = 0x04034b50;
 	const SIGNATURE_CENTRAL_DIRECTORY     = 0x02014b50;
 	const SIGNATURE_CENTRAL_DIRECTORY_END = 0x06054b50;
 	const COMPRESSION_DEFLATE             = 8;
 
-	private $zip = '';
-	private $bytes_parsed_so_far = 0;
-	private $state = self::STATE_SCAN;
-	private $header = null;
-	private $file_body_chunk = null;
-	private $file_compressed_bytes_read_so_far = null;
-	private $paused_incomplete_input = false;
+	private $cursor = '';
 	private $inflate_handle;
-	private $error_message;
 	
 	const STATE_SCAN = 'scan';
 	const STATE_FILE_ENTRY = 'file-entry';
@@ -31,66 +46,79 @@ class ZipStreamReader implements IStreamProcessor {
     static public function stream() {
         return new Demultiplexer(fn() => new ZipReaderStream());
     }
+
+	public function pause() {
+		return $this->cursor;
+	}
+
+	static public function resume(ZipStreamReaderCursor $cursor) {
+		$reader = new ZipStreamReader();
+		$reader->cursor = $cursor;
+		$reader->inflate_handle = inflate_init(ZLIB_ENCODING_RAW);
+		inflate_add($reader->inflate_handle, $cursor->last_compressed_bytes);
+		return $reader;
+	}
 	
 	public function __construct($bytes='') {
-		$this->zip = $bytes;
+		$this->cursor = new ZipStreamReaderCursor();
+		$this->cursor->zip = $bytes;
 	}
 
 	public function append_bytes(string $bytes)
 	{
-		$this->zip = substr($this->zip, $this->bytes_parsed_so_far) . $bytes;	
-        $this->bytes_parsed_so_far = 0;
-		$this->paused_incomplete_input = false;
+		$this->cursor->zip = substr($this->cursor->zip, $this->cursor->bytes_parsed_so_far) . $bytes;	
+        $this->cursor->bytes_parsed_so_far = 0;
+		$this->cursor->paused_incomplete_input = false;
 	}
 
 	public function is_paused_at_incomplete_input(): bool {
-		return $this->paused_incomplete_input;		
+		return $this->cursor->paused_incomplete_input;		
 	}
 
 	public function is_finished(): bool
 	{
-		return self::STATE_COMPLETE === $this->state || self::STATE_ERROR === $this->state;
+		return self::STATE_COMPLETE === $this->cursor->state || self::STATE_ERROR === $this->cursor->state;
 	}
 
     public function get_state()
     {
-        return $this->state;        
+        return $this->cursor->state;        
     }
 
     public function get_header()
     {
-        return $this->header;
+        return $this->cursor->header;
     }
 
     public function get_file_path()
     {
-        if(!$this->header) {
+        if(!$this->cursor->header) {
             return null;
         }
         
-        return $this->header['path'];        
+        return $this->cursor->header['path'];        
     }
 
     public function get_file_body_chunk()
     {
-        return $this->file_body_chunk;        
+        return $this->cursor->file_body_chunk;        
     }
 
     public function get_last_error(): ?string
     {
-        return $this->error_message;        
+        return $this->cursor->error_message;        
     }
 
 	public function next()
 	{
         do {
-            if(self::STATE_SCAN === $this->state) {
+            if(self::STATE_SCAN === $this->cursor->state) {
                 if(false === $this->scan()) {
                     return false;
                 }
             }
 
-            switch ($this->state) {
+            switch ($this->cursor->state) {
                 case self::STATE_ERROR:
                 case self::STATE_COMPLETE:
                     return false;
@@ -116,42 +144,42 @@ class ZipStreamReader implements IStreamProcessor {
                 default:
                     return false;
             }
-        } while (self::STATE_SCAN === $this->state);
+        } while (self::STATE_SCAN === $this->cursor->state);
 
 		return true;
 	}
 
 	private function read_central_directory_entry()
 	{
-		if ($this->header && !empty($this->header['path'])) {
-			$this->header = null;
-			$this->state = self::STATE_SCAN;
+		if ($this->cursor->header && !empty($this->cursor->header['path'])) {
+			$this->cursor->header = null;
+			$this->cursor->state = self::STATE_SCAN;
 			return;
 		}
 
-		if (!$this->header) {
+		if (!$this->cursor->header) {
 			$data = $this->consume_bytes(42);
 			if ($data === false) {
 				$this->paused_incomplete_input = true;
 				return false;
 			}
-			$this->header = unpack(
+			$this->cursor->header = unpack(
 				'vversionCreated/vversionNeeded/vgeneralPurpose/vcompressionMethod/vlastModifiedTime/vlastModifiedDate/Vcrc/VcompressedSize/VuncompressedSize/vpathLength/vextraLength/vfileCommentLength/vdiskNumber/vinternalAttributes/VexternalAttributes/VfirstByteAt',
 				$data
 			);
 		}
 		
-		if($this->header) {
-			$n = $this->header['pathLength'] + $this->header['extraLength'] + $this->header['fileCommentLength'];
-			if (strlen($this->zip) < $this->bytes_parsed_so_far + $n) {
-				$this->paused_incomplete_input = true;
+		if($this->cursor->header) {
+			$n = $this->cursor->header['pathLength'] + $this->cursor->header['extraLength'] + $this->cursor->header['fileCommentLength'];
+			if (strlen($this->cursor->zip) < $this->cursor->bytes_parsed_so_far + $n) {
+				$this->cursor->paused_incomplete_input = true;
 				return false;
 			}
 
-			$this->header['path'] = $this->consume_bytes($this->header['pathLength']);
-			$this->header['extra'] = $this->consume_bytes($this->header['extraLength']);
-			$this->header['fileComment'] = $this->consume_bytes($this->header['fileCommentLength']);
-			if(!$this->header['path']) {
+			$this->cursor->header['path'] = $this->consume_bytes($this->cursor->header['pathLength']);
+			$this->cursor->header['extra'] = $this->consume_bytes($this->cursor->header['extraLength']);
+			$this->cursor->header['fileComment'] = $this->consume_bytes($this->cursor->header['fileCommentLength']);
+			if(!$this->cursor->header['path']) {
 				$this->set_error('Empty path in central directory entry');
 			}
 		}
@@ -159,50 +187,50 @@ class ZipStreamReader implements IStreamProcessor {
 
 	private function read_end_central_directory_entry()
 	{
-		if ($this->header && ( !empty($this->header['comment']) || 0 === $this->header['commentLength'] )) {
-			$this->header = null;
-			$this->state = self::STATE_SCAN;
+		if ($this->cursor->header && ( !empty($this->cursor->header['comment']) || 0 === $this->cursor->header['commentLength'] )) {
+			$this->cursor->header = null;
+			$this->cursor->state = self::STATE_SCAN;
 			return;
 		}
 		
-		if(!$this->header) {
+		if(!$this->cursor->header) {
 			$data = $this->consume_bytes(18);
 			if ($data === false) {
-				$this->paused_incomplete_input = true;
+				$this->cursor->paused_incomplete_input = true;
 				return false;
 			}
-			$this->header = unpack(
+			$this->cursor->header = unpack(
 				'vdiskNumber/vcentralDirectoryStartDisk/vnumberCentralDirectoryRecordsOnThisDisk/vnumberCentralDirectoryRecords/VcentralDirectorySize/VcentralDirectoryOffset/vcommentLength',
 				$data
 			);
 		}
 		
-		if($this->header && empty($this->header['comment']) && $this->header['commentLength'] > 0) {
-			$comment = $this->consume_bytes($this->header['commentLength']);
+		if($this->cursor->header && empty($this->cursor->header['comment']) && $this->cursor->header['commentLength'] > 0) {
+			$comment = $this->consume_bytes($this->cursor->header['commentLength']);
 			if(false === $comment) {
-				$this->paused_incomplete_input = true;
+				$this->cursor->paused_incomplete_input = true;
 				return false;
 			}
-			$this->header['comment'] = $comment;
+			$this->cursor->header['comment'] = $comment;
 		}		
 	}
 
 	private function scan() {
 		$signature = $this->consume_bytes(4);
 		if ($signature === false) {
-			$this->paused_incomplete_input = true;
+			$this->cursor->paused_incomplete_input = true;
 			return false;
 		}
 		$signature = unpack('V', $signature)[1];
 		switch($signature) {
 			case self::SIGNATURE_FILE:
-				$this->state = self::STATE_FILE_ENTRY;
+				$this->cursor->state = self::STATE_FILE_ENTRY;
 				break;
 			case self::SIGNATURE_CENTRAL_DIRECTORY:
-				$this->state = self::STATE_CENTRAL_DIRECTORY_ENTRY;
+				$this->cursor->state = self::STATE_CENTRAL_DIRECTORY_ENTRY;
 				break;
 			case self::SIGNATURE_CENTRAL_DIRECTORY_END:
-				$this->state = self::STATE_END_CENTRAL_DIRECTORY_ENTRY;
+				$this->cursor->state = self::STATE_END_CENTRAL_DIRECTORY_ENTRY;
 				break;
 			default:
 				$this->set_error('Invalid signature ' . $signature);
@@ -236,29 +264,29 @@ class ZipStreamReader implements IStreamProcessor {
 	 */
 	private function read_file_entry()
 	{
-		if (null === $this->header) {
+		if (null === $this->cursor->header) {
             $data = $this->consume_bytes(26);
             if ($data === false) {
-                $this->paused_incomplete_input = true;
+                $this->cursor->paused_incomplete_input = true;
                 return false;
             }
-            $this->header = unpack(
+            $this->cursor->header = unpack(
                 'vversionNeeded/vgeneralPurpose/vcompressionMethod/vlastModifiedTime/vlastModifiedDate/Vcrc/VcompressedSize/VuncompressedSize/vpathLength/vextraLength',
                 $data
             );
-            $this->file_compressed_bytes_read_so_far = 0;
+            $this->cursor->file_compressed_bytes_read_so_far = 0;
 		}
 		
-		if($this->header && empty($this->header['path'])) {
-            $n = $this->header['pathLength'] + $this->header['extraLength'];
-            if(strlen($this->zip) < $this->bytes_parsed_so_far + $n) {
-                $this->paused_incomplete_input = true;
+		if($this->cursor->header && empty($this->cursor->header['path'])) {
+            $n = $this->cursor->header['pathLength'] + $this->cursor->header['extraLength'];
+            if(strlen($this->cursor->zip) < $this->cursor->bytes_parsed_so_far + $n) {
+                $this->cursor->paused_incomplete_input = true;
                 return false;
             }
     
-            $this->header['path'] = $this->consume_bytes($this->header['pathLength']);
-            $this->header['extra'] = $this->consume_bytes($this->header['extraLength']);
-            if($this->header['compressionMethod'] === self::COMPRESSION_DEFLATE) {
+            $this->cursor->header['path'] = $this->consume_bytes($this->cursor->header['pathLength']);
+            $this->cursor->header['extra'] = $this->consume_bytes($this->cursor->header['extraLength']);
+            if($this->cursor->header['compressionMethod'] === self::COMPRESSION_DEFLATE) {
                 $this->inflate_handle = inflate_init(ZLIB_ENCODING_RAW);
             }
 		}
@@ -269,29 +297,33 @@ class ZipStreamReader implements IStreamProcessor {
 	}
 
 	private function read_file_entry_body_chunk() {
-        $this->file_body_chunk = null;
+        $this->cursor->file_body_chunk = null;
 
-		$file_body_bytes_left = $this->header['compressedSize'] - $this->file_compressed_bytes_read_so_far;
+		$file_body_bytes_left = $this->cursor->header['compressedSize'] - $this->cursor->file_compressed_bytes_read_so_far;
         if($file_body_bytes_left === 0) {
-			$this->header = null;
+			$this->cursor->header = null;
 			$this->inflate_handle = null;
-			$this->file_compressed_bytes_read_so_far = 0;
-			$this->state = self::STATE_SCAN;
+			$this->cursor->file_compressed_bytes_read_so_far = 0;
+			$this->cursor->state = self::STATE_SCAN;
 			return;
 		}
 
-		if(strlen($this->zip) === $this->bytes_parsed_so_far) {
-			$this->paused_incomplete_input = true;
+		if(strlen($this->cursor->zip) === $this->cursor->bytes_parsed_so_far) {
+			$this->cursor->paused_incomplete_input = true;
 			return false;
 		}
 
 		$chunk_size = min(8096, $file_body_bytes_left);
-		$compressed_bytes = substr($this->zip, $this->bytes_parsed_so_far, $chunk_size);
-		$this->bytes_parsed_so_far += strlen($compressed_bytes);
-		$this->file_compressed_bytes_read_so_far += strlen($compressed_bytes);
+		$compressed_bytes = substr($this->cursor->zip, $this->cursor->bytes_parsed_so_far, $chunk_size);
+		$this->cursor->bytes_parsed_so_far += strlen($compressed_bytes);
+		$this->cursor->file_compressed_bytes_read_so_far += strlen($compressed_bytes);
 
-		if ($this->header['compressionMethod'] === self::COMPRESSION_DEFLATE) {
-			$uncompressed_bytes = inflate_add($this->inflate_handle, $compressed_bytes);
+		if ($this->cursor->header['compressionMethod'] === self::COMPRESSION_DEFLATE) {
+			$uncompressed_bytes = inflate_add($this->inflate_handle, $compressed_bytes, ZLIB_PARTIAL_FLUSH);
+			if($uncompressed_bytes) {
+				$this->cursor->last_compressed_bytes = '';
+			}
+			$this->cursor->last_compressed_bytes .= $compressed_bytes;
 			if ( $uncompressed_bytes === false || inflate_get_status( $this->inflate_handle ) === false ) {
 				$this->set_error('Failed to inflate');
 				return false;
@@ -300,24 +332,45 @@ class ZipStreamReader implements IStreamProcessor {
 			$uncompressed_bytes = $compressed_bytes;
 		}
 
-		$this->file_body_chunk = $uncompressed_bytes;
+		$this->cursor->file_body_chunk = $uncompressed_bytes;
 	}
 
 	private function set_error($message) {
-		$this->state = self::STATE_ERROR;
-		$this->error_message = $message;
-        $this->paused_incomplete_input = false;
+		$this->cursor->state = self::STATE_ERROR;
+		$this->cursor->error_message = $message;
+        $this->cursor->paused_incomplete_input = false;
 	}
 
 	private function consume_bytes($n) {
-		if(strlen($this->zip) < $this->bytes_parsed_so_far + $n) {
+		if(strlen($this->cursor->zip) < $this->cursor->bytes_parsed_so_far + $n) {
 			return false;
 		}
 
-		$bytes = substr($this->zip, $this->bytes_parsed_so_far, $n);
-		$this->bytes_parsed_so_far += $n;
+		$bytes = substr($this->cursor->zip, $this->cursor->bytes_parsed_so_far, $n);
+		$this->cursor->bytes_parsed_so_far += $n;
 		return $bytes;
 	}
+
+}
+
+if (RUN_ZIP_SMOKE_TEST) {
+	for($i = 73; $i < 100; $i++) {
+		$fp = fopen('./test.zip', 'r');
+		$reader = new ZipStreamReader(fread($fp, $i));
+		$reader->next();
+		var_dump($reader->get_file_body_chunk());
+
+		$state = $reader->pause();
+		$reader2 = ZipStreamReader::resume($state);
+		var_dump($reader2->get_file_body_chunk());
+		$reader2->append_bytes(fread($fp, 100));
+		var_dump($reader2->next());
+		var_dump($reader2->get_file_body_chunk());
+		// print_r($reader2->get_header());
+		fclose($fp);
+		die();
+	}
+	die();
 
 }
 
