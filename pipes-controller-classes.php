@@ -2,6 +2,7 @@
 
 require __DIR__ . '/bootstrap.php';
 require __DIR__ . '/zip-stream-reader.php';
+require __DIR__ . '/zip-stream-reader-local.php';
 
 use WordPress\AsyncHttp\Client;
 use WordPress\AsyncHttp\Request;
@@ -148,19 +149,18 @@ class File_Byte_Stream extends Byte_Stream {
 
     public function pause()
     {
-        return new Paused_Stream(get_class($this), [
+        return [
             'file_path' => $this->file_path,
             'chunk_size' => $this->chunk_size,
             'offset_in_file' => $this->offset_in_file,
             'output_bytes' => $this->state->output_bytes,
-        ]);
+        ];
     }
 
     public function resume($paused_state)
     {
-        $data = $paused_state['data'];
-        $this->offset_in_file = $data['offset_in_file'];
-        $this->state->output_bytes = $data['output_bytes'];
+        $this->offset_in_file = $paused_state['offset_in_file'];
+        $this->state->output_bytes = $paused_state['output_bytes'];
     }
 
     protected function generate_next_chunk(): bool {
@@ -209,17 +209,16 @@ class ProcessorByteStream extends Callback_Byte_Stream
 
     public function pause()
     {
-        return new Paused_Stream(get_class($this), [
+        return [
             'processor' => $this->processor->pause(),
             'output_bytes' => $this->state->output_bytes,
-        ]);
+        ];
     }
 
     public function resume($paused_state)
     {
-        $data = $paused_state['data'];
-        $this->processor->resume($data['processor']);
-        $this->state->output_bytes = $data['output_bytes'];
+        $this->processor->resume($paused_state['processor']);
+        $this->state->output_bytes = $paused_state['output_bytes'];
     }    
     
 }
@@ -313,24 +312,24 @@ class Demultiplexer extends Byte_Stream {
         foreach($this->streams as $name => $stream) {
             $paused_streams[$name] = $stream->pause();
         }
-        return new Paused_Stream(get_class($this), [
+        return [
             'streams' => $paused_streams,
             'last_stream' => array_search($this->last_stream, $this->streams),
             'last_input_key' => $this->last_input_key,
-        ]);
+        ];
     }
 
     public function resume($paused_state)
     {
-        foreach($paused_state['data']['streams'] as $name => $stream) {
+        foreach($paused_state['streams'] as $name => $stream) {
             if(!isset($this->streams[$name])) {
                 $create = $this->stream_factory;
                 $this->streams[$name] = $create();
             }
             $this->streams[$name]->resume($stream);
         }
-        $this->last_stream = $this->streams[$paused_state['data']['last_stream']];
-        $this->last_input_key = $paused_state['data']['last_input_key'];
+        $this->last_stream = $this->streams[$paused_state['last_stream']];
+        $this->last_input_key = $paused_state['last_input_key'];
     }
 
     public function get_substream()
@@ -425,19 +424,18 @@ class StreamChain extends Byte_Stream implements ArrayAccess, Iterator {
             $name = array_search($stream, $this->streams);
             $paused_execution_stack[] = $name;
         }
-        return new Paused_Stream(get_class($this), [
+        return [
             'streams' => $paused_streams,
             'execution_stack' => $paused_execution_stack,
-        ]);
+        ];
     }
 
     public function resume($paused_state)
     {
-        $data = $paused_state['data'];
-        foreach($data['streams'] as $name => $stream) {
+        foreach($paused_state['streams'] as $name => $stream) {
             $this->streams[$name]->resume($stream);
         }
-        foreach($data['execution_stack'] as $name) {
+        foreach($paused_state['execution_stack'] as $name) {
             $this->push_stream($this->streams[$name]);
         }
     }
@@ -725,5 +723,32 @@ class ZIP_Reader
                 return false;
             }
         );
+    }
+}
+
+class ZIP_Reader_Local
+{
+    static public function stream($file_path)
+    {
+        $demuxed = ProcessorByteStream::demuxed(
+            function () use ($file_path) { return new ZipStreamReaderLocal($file_path); },
+            function (ZipStreamReaderLocal $zip_reader, ByteStreamState $state) {
+                while ($zip_reader->next()) {
+                    switch ($zip_reader->get_state()) {
+                        case ZipStreamReaderLocal::STATE_FILE_ENTRY:
+                            $state->file_id = $zip_reader->get_file_path();
+                            $state->output_bytes = $zip_reader->get_file_body_chunk();
+                            return true;
+                    }
+                }
+                $state->finish();
+                return false;
+            }
+        );
+        // Workaround for the streaming interface requirements –
+        // multiplexer only creates new streams when it gets some incoming contextual bytes.
+        // @TODO: lift this limitation.
+        $demuxed->append_bytes('');
+        return $demuxed;
     }
 }

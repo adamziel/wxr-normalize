@@ -9,7 +9,7 @@ class ZipStreamReaderCursor {
 	public $header = null;
 	public $file_body_chunk = null;
 	/**
-	 * Experimental: Store the last used compressed chunk so that we can recreate
+	 * Experimental: Store the last 32kb so that we can recreate
 	 * the inflate context. This is necessary, because deflate-raw has a variable
 	 * block size and the binary data we've already seen contain information required
 	 * to continue the decompression process.
@@ -17,7 +17,7 @@ class ZipStreamReaderCursor {
 	 * @TODO: Rigorously confirm that this reasoning is correct and then rigorously
 	 *        keep track of as many $last_compressed_bytes as necessary.
 	 */
-	public $last_compressed_bytes = '';
+	public $deflate_sliding_window = '';
 	public $file_compressed_bytes_read_so_far = null;
 	public $paused_incomplete_input = false;
 	public $error_message;
@@ -43,20 +43,35 @@ class ZipStreamReader {
 	const STATE_COMPLETE = 'complete';
 	const STATE_ERROR = 'error';
 
-    static public function stream() {
-        return new Demultiplexer(fn() => new ZipReaderStream());
-    }
-
 	public function pause() {
-		return $this->cursor;
+		return [
+			'cursor' => [
+				'zip' => $this->cursor->zip,
+				'bytes_parsed_so_far' => $this->cursor->bytes_parsed_so_far,
+				'state' => $this->cursor->state,
+				'header' => $this->cursor->header,
+				'file_body_chunk' => $this->cursor->file_body_chunk,
+				'last_compressed_bytes' => $this->cursor->last_compressed_bytes,
+				'file_compressed_bytes_read_so_far' => $this->cursor->file_compressed_bytes_read_so_far,
+				'paused_incomplete_input' => $this->cursor->paused_incomplete_input,
+			]
+		];
 	}
 
-	static public function resume(ZipStreamReaderCursor $cursor) {
-		$reader = new ZipStreamReader();
-		$reader->cursor = $cursor;
-		$reader->inflate_handle = inflate_init(ZLIB_ENCODING_RAW);
-		inflate_add($reader->inflate_handle, $cursor->last_compressed_bytes);
-		return $reader;
+	public function resume($paused_state) {
+		$serialized_cursor = $paused_state['cursor'];
+		$this->cursor = new ZipStreamReaderCursor();
+		$this->cursor->zip = $serialized_cursor['zip'];
+		$this->cursor->bytes_parsed_so_far = $serialized_cursor['bytes_parsed_so_far'];
+		$this->cursor->state = $serialized_cursor['state'];
+		$this->cursor->header = $serialized_cursor['header'];
+		$this->cursor->file_body_chunk = $serialized_cursor['file_body_chunk'];
+		$this->cursor->last_compressed_bytes = $serialized_cursor['last_compressed_bytes'];
+		$this->cursor->file_compressed_bytes_read_so_far = $serialized_cursor['file_compressed_bytes_read_so_far'];
+		$this->cursor->paused_incomplete_input = $serialized_cursor['paused_incomplete_input'];
+
+		$this->inflate_handle = inflate_init(ZLIB_ENCODING_RAW);
+		inflate_add($this->inflate_handle, $this->cursor->last_compressed_bytes);
 	}
 	
 	public function __construct($bytes='') {
@@ -320,8 +335,9 @@ class ZipStreamReader {
 
 		if ($this->cursor->header['compressionMethod'] === self::COMPRESSION_DEFLATE) {
 			$uncompressed_bytes = inflate_add($this->inflate_handle, $compressed_bytes, ZLIB_PARTIAL_FLUSH);
+			// @TODO: Find a way to resume the inflate context without storing the entire prior context.
 			if($uncompressed_bytes) {
-				$this->cursor->last_compressed_bytes = '';
+				// $this->cursor->last_compressed_bytes = '';
 			}
 			$this->cursor->last_compressed_bytes .= $compressed_bytes;
 			if ( $uncompressed_bytes === false || inflate_get_status( $this->inflate_handle ) === false ) {
